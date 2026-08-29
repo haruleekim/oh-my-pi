@@ -47,7 +47,7 @@ import { AgentLifecycleManager, type AgentReviver } from "../registry/agent-life
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { ensurePersistedRoster, isCurrentSessionRosterRef } from "../registry/persisted-agents";
 import { type CreateAgentSessionOptions, createAgentSession, discoverAuthStorage } from "../sdk";
-import type { AgentSession, AgentSessionEvent, Prewalk } from "../session/agent-session";
+import type { AgentSession, AgentSessionEvent, Prewalk, SubagentSessionReadyHandler } from "../session/agent-session";
 import { type ArtifactManager, writeArtifact } from "../session/artifacts";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "../session/async-job-delivery";
 import type { AuthStorage } from "../session/auth-storage";
@@ -396,6 +396,7 @@ export interface ExecutorOptions {
 	agent: AgentDefinition;
 	task: string;
 	assignment?: string;
+	invocationKind?: "task" | "eval";
 	/** Shared background from the task call (`task.batch`), rendered into the subagent's system prompt. */
 	context?: string;
 	/**
@@ -467,6 +468,7 @@ export interface ExecutorOptions {
 	restrictToolNames?: boolean;
 	signal?: AbortSignal;
 	onProgress?: (progress: AgentProgress) => void;
+	onSubagentSessionReady?: SubagentSessionReadyHandler;
 	/**
 	 * Epochs (ms, `Date.now()`) bracketing the concurrency-semaphore wait:
 	 * `invokedAt` is stamped at the spawn boundary before `acquire()`,
@@ -1011,6 +1013,7 @@ interface RunMonitorArgs {
 	parentToolCallId?: string;
 	detached?: boolean;
 	sessionFile?: string;
+	sessionId?: string;
 	/** Soft assistant-request budget; 0 disables the guard. */
 	softRequestBudget: number;
 	/** Whether crossing the soft budget injects a wrap-up steering notice. */
@@ -1074,6 +1077,7 @@ interface SubagentRunMonitor {
 	/** Final raw output: end-of-run assistant text when available, else accumulated chunks. */
 	rawOutput(): string;
 	scheduleProgress(flush?: boolean): void;
+	setSessionSnapshot(sessionId: string | undefined, sessionFile: string | undefined): void;
 	/** Stop processing events and clear listeners/timers. Call once the run settled. */
 	finish(): void;
 }
@@ -1105,6 +1109,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	const progress: AgentProgress = {
 		index,
 		id,
+		sessionId: args.sessionId,
 		agent: agent.name,
 		agentSource: agent.source,
 		status: "running",
@@ -1137,6 +1142,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	const abortController = new AbortController();
 	const abortSignal = abortController.signal;
 	let activeSession: AgentSession | null = null;
+	let sessionFile = args.sessionFile;
 	let yieldCalled = false;
 	let yieldCallPending = false;
 	let yieldInvalidatedByAsync = false;
@@ -1352,7 +1358,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 			detached: args.detached,
 			assignment,
 			progress: { ...progress },
-			sessionFile: args.sessionFile,
+			sessionFile,
 		};
 		emitSubagentFrame(args.eventBus, args.subagentEventBus, TASK_SUBAGENT_PROGRESS_CHANNEL, progressPayload);
 		lastProgressEmitMs = Date.now();
@@ -1899,6 +1905,10 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 			budgetLimitExceeded ||
 			abortReason === undefined,
 		requestAbort,
+		setSessionSnapshot: (sessionId, nextSessionFile) => {
+			progress.sessionId = sessionId;
+			sessionFile = nextSessionFile;
+		},
 		failWithError,
 		abortActiveSession,
 		waitForActiveSessionAbort,
@@ -2220,6 +2230,8 @@ interface FinalizeRunArgs {
 	 */
 	followUpTurn?: boolean;
 	sessionFile?: string;
+	sessionId?: string;
+	isIsolated: boolean;
 	startTime: number;
 }
 
@@ -2387,7 +2399,10 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		agentSource: agent.source,
 		description: progress.description,
 		status: progress.status as "completed" | "failed" | "aborted",
+		sessionId: args.sessionId,
 		sessionFile: args.sessionFile,
+		error: exitCode !== 0 && stderr ? stderr : undefined,
+		abortReason: finalAbortReason,
 		index,
 	};
 	emitSubagentFrame(args.eventBus, args.subagentEventBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, settledPayload);
@@ -2395,6 +2410,9 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 	return {
 		index,
 		id,
+		sessionId: args.sessionId,
+		sessionFile: args.sessionFile,
+		isIsolated: args.isIsolated,
 		agent: agent.name,
 		agentSource: agent.source,
 		task,
@@ -2638,6 +2656,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 					detached: true,
 					followUpTurn: true,
 					sessionFile,
+					isIsolated: false,
 					startTime: turnStartTime,
 				});
 				if (!aborted && !error) {
@@ -2899,6 +2918,7 @@ export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Pro
 		detached: true,
 		followUpTurn: true,
 		sessionFile,
+		isIsolated: false,
 		startTime,
 	});
 }
@@ -2939,6 +2959,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			task,
 			assignment,
 			description: options.description,
+			isIsolated: worktree !== undefined,
 			exitCode: 1,
 			output: "",
 			stderr: "Cancelled before start",
@@ -3041,6 +3062,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 
 	const lspEnabled = enableLsp ?? true;
 	const skipPythonPreflight = Array.isArray(toolNames) && !toolNames.includes("eval");
+
+	let childSessionId: string | undefined;
+	let childSessionFile = subtaskSessionFile;
 
 	const monitor = createSubagentRunMonitor({
 		index,
@@ -3437,12 +3461,44 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				void sessionPromise.then(created => created.session.dispose()).catch(() => {});
 				throw err;
 			}
+			childSessionId = session.sessionManager.getSessionId();
+			childSessionFile = session.sessionManager.getSessionFile() ?? undefined;
+			monitor.setSessionSnapshot(childSessionId, childSessionFile);
+			session.installSubagentSessionReadyHandler(options.onSubagentSessionReady);
 			sessionCreatedAt = performance.now();
 
 			monitor.setActiveSession(session);
 			// Run-state notifications precede deferrable wire-level `agent_end`,
 			// so adopted keep-alive lifecycle cannot get stuck during prompt unwind.
 			AgentRegistry.global().syncSessionStatus(id, session);
+			if (
+				options.onSubagentSessionReady &&
+				(options.invocationKind ?? "task") === "task" &&
+				worktree === undefined
+			) {
+				try {
+					await awaitAbortable(
+						Promise.resolve().then(() =>
+							options.onSubagentSessionReady?.({
+								invocationKind: "task",
+								agentId: id,
+								parentAgentId: options.parentAgentId ?? MAIN_AGENT_ID,
+								parentToolCallId: options.parentToolCallId,
+								index,
+								isolated: false,
+								session,
+								cancel: () => monitor.requestAbort("signal"),
+							}),
+						),
+					);
+				} catch (error) {
+					if (abortSignal.aborted) checkAbort();
+					logger.warn("Subagent session readiness handler failed", {
+						id,
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+			}
 			if (sessionFile !== null && worktree === undefined) {
 				// Lifecycle reviver: park closed the JSONL writer, so reopening takes
 				// the single-writer lock cleanly and restores the full message history
@@ -3467,6 +3523,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					const { session: revived } = await createAgentSession(
 						buildSubagentSessionOptions(reopened, expectedAgentRef),
 					);
+					revived.installSubagentSessionReadyHandler(options.onSubagentSessionReady);
 					// Re-run the executor's extension wiring on the rebuilt session.
 					// Skipping it leaves the runner pre-init, so a `tool_call` handler
 					// touching a runtime action trips the fail-closed gate and blocks
@@ -3492,7 +3549,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				agentSource: agent.source,
 				description: options.description,
 				status: "started" as const,
-				sessionFile: subtaskSessionFile,
+				sessionId: childSessionId,
+				sessionFile: childSessionFile,
 				index,
 			};
 			emitSubagentFrame(options.eventBus, options.subagentEventBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, startedPayload);
@@ -3813,7 +3871,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		subagentEventBus: options.subagentEventBus,
 		parentToolCallId: options.parentToolCallId,
 		detached: options.detached,
-		sessionFile: subtaskSessionFile,
+		sessionId: childSessionId,
+		sessionFile: childSessionFile,
+		isIsolated: worktree !== undefined,
 		startTime,
 	});
 	AgentRegistry.global().setHistory(id, { outputPath: result.outputPath });

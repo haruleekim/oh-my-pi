@@ -17,6 +17,7 @@ import { loadOverallPlanReference } from "../plan-mode/plan-handoff";
 import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" with { type: "text" };
 import subagentUserPromptTemplate from "../prompts/system/subagent-user-prompt.md" with { type: "text" };
 import { MAIN_AGENT_ID } from "../registry/agent-registry";
+import type { SubagentSessionReadyHandler } from "../session/agent-session";
 import type { TaskEffort } from "../thinking";
 import type { ToolSession } from "../tools";
 import { isIrcEnabled } from "../tools/hub";
@@ -128,6 +129,7 @@ export interface StructuredSubagentRequest {
 	workPoolYieldItems?: WorkPoolYieldItem[];
 	signal?: AbortSignal;
 	onProgress?: (progress: AgentProgress) => void;
+	onSubagentSessionReady?: SubagentSessionReadyHandler;
 }
 
 /** A normalized preflight result, reusable by tests and adapters. */
@@ -395,6 +397,7 @@ function buildExecutorOptions(
 	id: string,
 ): ExecutorOptions {
 	const { session } = request;
+	const onSubagentSessionReady = request.onSubagentSessionReady ?? session.getSubagentSessionReadyHandler?.();
 	const { skills, autoloadSkills } = resolveAutoloadSkills(session, policy.agent);
 	const localProtocolOptions: LocalProtocolOptions = session.localProtocolOptions ?? {
 		getArtifactsDir: session.getArtifactsDir ?? (() => null),
@@ -403,6 +406,7 @@ function buildExecutorOptions(
 	const restrictToolNames = policy.planMode || session.restrictToolNames === true;
 	const enableMCP = !restrictToolNames && (session.enableMCP ?? true);
 	return {
+		invocationKind: request.invocationKind,
 		cwd: session.cwd,
 		additionalDirectories: session.additionalDirectories,
 		getApiKey: session.getApiKey,
@@ -446,6 +450,7 @@ function buildExecutorOptions(
 		eventBus: session.eventBus,
 		subagentEventBus: session.subagentEventBus,
 		onProgress: request.onProgress,
+		onSubagentSessionReady,
 		authStorage: session.authStorage,
 		modelRegistry: session.modelRegistry,
 		settings: session.settings,

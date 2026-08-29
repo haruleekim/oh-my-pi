@@ -82,6 +82,7 @@ import {
 	TTS_LOCAL_MODELS,
 	TTS_LOCAL_VOICE_OPTIONS,
 } from "../../tts/models";
+import type { EventBus } from "../../utils/event-bus";
 import { canonicalizeMessage } from "../../utils/thinking-display";
 import { createAcpClientBridge } from "./acp-client-bridge";
 import {
@@ -89,6 +90,7 @@ import {
 	mapAgentSessionEventToAcpSessionUpdates,
 	normalizeReplayToolArguments,
 } from "./acp-event-mapper";
+import { ACP_SUBAGENT_ATTACH_TIMEOUT_MS, AcpSubagentBridge } from "./acp-subagents";
 import { ACP_TERMINAL_AUTH_FLAG } from "./terminal-auth";
 
 const ACP_DEFAULT_MODE_ID = "default";
@@ -165,7 +167,11 @@ function isPromptTurnInFlight(turn: PromptTurnState | undefined): turn is Prompt
 
 type ManagedSessionRecord = {
 	session: AgentSession;
+	wireSessionId: string;
 	setToolUIContext: ((uiContext: ExtensionUIContext, hasUI: boolean) => void) | undefined;
+	ownership: "root" | "cold" | "borrowed";
+	subagentBridge: AcpSubagentBridge | undefined;
+	ownsSubagentBridge: boolean;
 	mcpManager: MCPManager | undefined;
 	// Ordered queue of MCP tool refreshes for this record. Rebuilt per
 	// `#configureMcpServers` call; drained on reconfigure so a stale in-flight
@@ -183,7 +189,14 @@ type ManagedSessionRecord = {
 	closedError: PromptLifecycleError | undefined;
 	promptEventHandlers: Set<Promise<void>>;
 	extensionUserMessageTasks: Set<Promise<void>>;
+	replayMessages: readonly ReplayableMessage[] | undefined;
 };
+
+interface PreparedSessionOptions {
+	ownership?: "root" | "cold";
+	subagentEventBus?: EventBus;
+	subagentBridge?: AcpSubagentBridge;
+}
 
 type ReplayableMessage = {
 	role: string;
@@ -221,18 +234,26 @@ type MCPSourceMap = {
 type AcpSessionHandle = {
 	session: AgentSession;
 	setToolUIContext: (uiContext: ExtensionUIContext, hasUI: boolean) => void;
+	subagentEventBus?: EventBus;
 };
 
 type CreateAcpSession = (
 	cwd: string,
 	options?: { interactivePrompts?: boolean },
 ) => Promise<AgentSession | AcpSessionHandle>;
-
 function normalizeCreatedAcpSession(created: AgentSession | AcpSessionHandle): {
 	session: AgentSession;
 	setToolUIContext: AcpSessionHandle["setToolUIContext"] | undefined;
+	subagentEventBus: EventBus | undefined;
 } {
-	return "session" in created ? created : { session: created, setToolUIContext: undefined };
+	if ("session" in created) {
+		return {
+			session: created.session,
+			setToolUIContext: created.setToolUIContext,
+			subagentEventBus: created.subagentEventBus,
+		};
+	}
+	return { session: created, setToolUIContext: undefined, subagentEventBus: undefined };
 }
 
 type AcpSpeechOption = {
@@ -610,9 +631,11 @@ export class AcpAgent implements Agent {
 	#initialSession: AgentSession | undefined;
 	#createSession: CreateAcpSession;
 	#sessions = new Map<string, ManagedSessionRecord>();
+	#subagentBridges = new Set<AcpSubagentBridge>();
 	#disposePromise: Promise<void> | undefined;
 	#cleanupRegistered = false;
 	#clientCapabilities: ClientCapabilities | undefined;
+	#subagentAttachTimeoutMs = ACP_SUBAGENT_ATTACH_TIMEOUT_MS;
 	#cancelCleanupTimeoutMs = ACP_CANCEL_CLEANUP_TIMEOUT_MS;
 	#blobs = new BlobStore(getBlobsDir());
 
@@ -624,6 +647,10 @@ export class AcpAgent implements Agent {
 
 	setCancelCleanupTimeoutForTesting(timeoutMs: number): void {
 		this.#cancelCleanupTimeoutMs = Math.max(1, timeoutMs);
+	}
+
+	setSubagentAttachTimeoutForTesting(timeoutMs: number): void {
+		this.#subagentAttachTimeoutMs = Math.max(1, timeoutMs);
 	}
 
 	async initialize(params: InitializeRequest): Promise<InitializeResponse> {
@@ -700,12 +727,25 @@ export class AcpAgent implements Agent {
 	async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
 		this.#assertAbsoluteCwd(params.cwd);
 		const record = await this.#loadManagedSession(params.sessionId, params.cwd, params.mcpServers);
-		await this.#replaySessionHistory(record);
+		try {
+			await this.#replaySessionHistory(record);
+			if (record.ownership === "borrowed") {
+				await record.subagentBridge?.completeBorrowedAttach(params.sessionId);
+			}
+		} catch (error) {
+			if (record.ownership === "borrowed") {
+				this.#sessions.delete(params.sessionId);
+				record.subagentBridge?.failBorrowedAttach(params.sessionId);
+			}
+			throw error;
+		}
 		const response: LoadSessionResponse = {
 			configOptions: this.#buildConfigOptions(record.session),
 			modes: this.#buildModeState(record.session),
 		};
-		this.#scheduleBootstrapUpdates(record.session.sessionId);
+		if (record.ownership === "root") {
+			this.#scheduleBootstrapUpdates(record.session.sessionId);
+		}
 		return response;
 	}
 
@@ -760,6 +800,11 @@ export class AcpAgent implements Agent {
 
 	async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
 		const record = this.#getSessionRecord(params.sessionId);
+		if (record.ownership !== "root") {
+			throw RequestError.sessionBusy(`ACP subagent session is read-only: ${params.sessionId}`, {
+				reason: "subagent_read_only",
+			});
+		}
 		this.#applyModeChange(record.session, params.modeId);
 		await this.#connection.sessionUpdate({
 			sessionId: record.session.sessionId,
@@ -771,6 +816,11 @@ export class AcpAgent implements Agent {
 
 	async setSessionConfigOption(params: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse> {
 		const record = this.#getSessionRecord(params.sessionId);
+		if (record.ownership !== "root") {
+			throw RequestError.sessionBusy(`ACP subagent session is read-only: ${params.sessionId}`, {
+				reason: "subagent_read_only",
+			});
+		}
 		if (typeof params.value === "boolean") {
 			throw new Error(`Unsupported boolean ACP config option: ${params.configId}`);
 		}
@@ -817,6 +867,11 @@ export class AcpAgent implements Agent {
 
 	async prompt(params: PromptRequest): Promise<PromptResponse> {
 		const record = this.#getSessionRecord(params.sessionId);
+		if (record.ownership !== "root") {
+			throw RequestError.sessionBusy(`ACP subagent session is read-only: ${params.sessionId}`, {
+				reason: "subagent_read_only",
+			});
+		}
 		const activeTurn = record.promptTurn;
 		if (activeTurn && !activeTurn.settled && record.session.isStreaming) {
 			// New prompt arrived while the previous turn is still in-flight (e.g. the
@@ -1066,6 +1121,13 @@ export class AcpAgent implements Agent {
 
 	async cancel(params: { sessionId: string }): Promise<void> {
 		const record = this.#getSessionRecord(params.sessionId);
+		if (record.ownership === "borrowed") {
+			record.subagentBridge?.cancelBorrowed(params.sessionId);
+			return;
+		}
+		if (record.ownership === "cold") {
+			return;
+		}
 		const promptTurn = record.promptTurn;
 		if (!promptTurn || promptTurn.settled) {
 			return;
@@ -1224,7 +1286,7 @@ export class AcpAgent implements Agent {
 	}
 
 	async #createNewSessionRecord(cwd: string, mcpServers: McpServer[]): Promise<ManagedSessionRecord> {
-		const { session, setToolUIContext } = normalizeCreatedAcpSession(
+		const { session, setToolUIContext, subagentEventBus } = normalizeCreatedAcpSession(
 			await this.#createSession(path.resolve(cwd), {
 				interactivePrompts: this.#clientCapabilities?.elicitation?.form != null,
 			}),
@@ -1235,15 +1297,47 @@ export class AcpAgent implements Agent {
 			await this.#disposeStandaloneSession(session);
 			throw error;
 		}
-		return await this.#registerPreparedSession(session, mcpServers, setToolUIContext);
+		return await this.#registerPreparedSession(session, mcpServers, setToolUIContext, { subagentEventBus });
 	}
 
 	async #loadManagedSession(sessionId: string, cwd: string, mcpServers: McpServer[]): Promise<ManagedSessionRecord> {
 		const existing = this.#sessions.get(sessionId);
 		if (existing) {
 			this.#assertMatchingCwd(existing.session, cwd);
-			await this.#configureMcpServers(existing, mcpServers);
+			if (existing.ownership === "root") {
+				await this.#configureMcpServers(existing, mcpServers);
+			}
 			return existing;
+		}
+
+		for (const bridge of this.#subagentBridges) {
+			const borrowed = bridge.beginBorrowedAttach(sessionId);
+			if (!borrowed) continue;
+			try {
+				this.#assertMatchingCwd(borrowed.session, cwd);
+			} catch (error) {
+				bridge.failBorrowedAttach(sessionId);
+				throw error;
+			}
+			const record = this.#createManagedSessionRecord(
+				borrowed.session,
+				undefined,
+				"borrowed",
+				bridge,
+				false,
+				borrowed.replayMessages as readonly ReplayableMessage[],
+			);
+			this.#sessions.set(sessionId, record);
+			return record;
+		}
+
+		for (const bridge of this.#subagentBridges) {
+			const cold = bridge.getColdChild(sessionId);
+			if (!cold) continue;
+			return await this.#openStoredSession(cold.sessionFile, cwd, [], sessionId, {
+				ownership: "cold",
+				subagentBridge: bridge,
+			});
 		}
 
 		const storedSession = await this.#findStoredSession(sessionId, cwd);
@@ -1257,7 +1351,9 @@ export class AcpAgent implements Agent {
 		const existing = this.#sessions.get(sessionId);
 		if (existing) {
 			this.#assertMatchingCwd(existing.session, cwd);
-			await this.#configureMcpServers(existing, mcpServers);
+			if (existing.ownership === "root") {
+				await this.#configureMcpServers(existing, mcpServers);
+			}
 			return existing;
 		}
 
@@ -1270,7 +1366,7 @@ export class AcpAgent implements Agent {
 
 	async #forkManagedSession(params: ForkSessionRequest): Promise<ManagedSessionRecord> {
 		const sourcePath = await this.#resolveForkSourceSessionPath(params.sessionId);
-		const { session, setToolUIContext } = normalizeCreatedAcpSession(
+		const { session, setToolUIContext, subagentEventBus } = normalizeCreatedAcpSession(
 			await this.#createSession(path.resolve(params.cwd), {
 				interactivePrompts: this.#clientCapabilities?.elicitation?.form != null,
 			}),
@@ -1288,7 +1384,9 @@ export class AcpAgent implements Agent {
 			await this.#disposeStandaloneSession(session);
 			throw error;
 		}
-		return await this.#registerPreparedSession(session, params.mcpServers ?? [], setToolUIContext);
+		return await this.#registerPreparedSession(session, params.mcpServers ?? [], setToolUIContext, {
+			subagentEventBus,
+		});
 	}
 
 	async #openStoredSession(
@@ -1296,8 +1394,9 @@ export class AcpAgent implements Agent {
 		cwd: string,
 		mcpServers: McpServer[],
 		sessionId: string,
+		options: PreparedSessionOptions = {},
 	): Promise<ManagedSessionRecord> {
-		const { session, setToolUIContext } = normalizeCreatedAcpSession(
+		const { session, setToolUIContext, subagentEventBus } = normalizeCreatedAcpSession(
 			await this.#createSession(path.resolve(cwd), {
 				interactivePrompts: this.#clientCapabilities?.elicitation?.form != null,
 			}),
@@ -1311,22 +1410,59 @@ export class AcpAgent implements Agent {
 			await this.#disposeStandaloneSession(session);
 			throw error;
 		}
-		return await this.#registerPreparedSession(session, mcpServers, setToolUIContext);
+		return await this.#registerPreparedSession(session, mcpServers, setToolUIContext, {
+			...options,
+			subagentEventBus: options.subagentEventBus ?? subagentEventBus,
+		});
 	}
 
 	async #registerPreparedSession(
 		session: AgentSession,
 		mcpServers: McpServer[],
 		setToolUIContext: ((uiContext: ExtensionUIContext, hasUI: boolean) => void) | undefined,
+		options: PreparedSessionOptions = {},
 	): Promise<ManagedSessionRecord> {
-		const record = this.#createManagedSessionRecord(session, setToolUIContext);
-		session.setClientBridge(createAcpClientBridge(this.#connection, session.sessionId, this.#clientCapabilities));
-		// `record.lifetimeUnsubscribe` is installed in `#scheduleBootstrapUpdates`
-		// so it shares the bootstrap race guard — see that comment for why.
+		const ownership = options.ownership ?? "root";
+		let subagentBridge = options.subagentBridge;
+		let ownsSubagentBridge = false;
+		if (
+			ownership === "root" &&
+			!subagentBridge &&
+			options.subagentEventBus &&
+			this.#clientCapabilities?._meta?.subagent_session_info === true
+		) {
+			const rootSessionId = session.sessionManager.getSessionId();
+			const rootAgentId = session.getAgentId() ?? `acp:${rootSessionId}`;
+			subagentBridge = new AcpSubagentBridge(
+				this.#connection,
+				this.#clientCapabilities,
+				rootSessionId,
+				rootAgentId,
+				options.subagentEventBus,
+				this.#subagentAttachTimeoutMs,
+			);
+			ownsSubagentBridge = true;
+			this.#subagentBridges.add(subagentBridge);
+			session.installSubagentSessionReadyHandler(subagentBridge.prepareChild);
+		}
+		const record = this.#createManagedSessionRecord(
+			session,
+			setToolUIContext,
+			ownership,
+			subagentBridge,
+			ownsSubagentBridge,
+		);
+		session.setClientBridge(
+			createAcpClientBridge(this.#connection, session.sessionManager.getSessionId(), this.#clientCapabilities, {
+				deferAgentInitiatedTurns: ownership === "root",
+			}),
+		);
 		try {
-			await this.#configureExtensions(record);
-			await this.#configureMcpServers(record, mcpServers);
-			this.#sessions.set(session.sessionId, record);
+			if (ownership === "root") {
+				await this.#configureExtensions(record);
+				await this.#configureMcpServers(record, mcpServers);
+			}
+			this.#sessions.set(session.sessionManager.getSessionId(), record);
 			return record;
 		} catch (error) {
 			await this.#disposeSessionRecord(record);
@@ -1336,11 +1472,19 @@ export class AcpAgent implements Agent {
 
 	#createManagedSessionRecord(
 		session: AgentSession,
-		setToolUIContext: ((uiContext: ExtensionUIContext, hasUI: boolean) => void) | undefined = undefined,
+		setToolUIContext: ((uiContext: ExtensionUIContext, hasUI: boolean) => void) | undefined,
+		ownership: ManagedSessionRecord["ownership"],
+		subagentBridge: AcpSubagentBridge | undefined,
+		ownsSubagentBridge: boolean,
+		replayMessages: readonly ReplayableMessage[] | undefined = undefined,
 	): ManagedSessionRecord {
 		return {
 			session,
+			wireSessionId: session.sessionManager.getSessionId(),
 			setToolUIContext,
+			ownership,
+			subagentBridge,
+			ownsSubagentBridge,
 			mcpManager: undefined,
 			mcpRefreshChain: undefined,
 			promptTurn: undefined,
@@ -1352,6 +1496,7 @@ export class AcpAgent implements Agent {
 			closedError: undefined,
 			promptEventHandlers: new Set(),
 			extensionUserMessageTasks: new Set(),
+			replayMessages,
 			lifetimeUnsubscribe: undefined,
 		};
 	}
@@ -1390,6 +1535,11 @@ export class AcpAgent implements Agent {
 	async #resolveForkSourceSessionPath(sessionId: string): Promise<string> {
 		const loaded = this.#sessions.get(sessionId);
 		if (loaded) {
+			if (loaded.ownership !== "root") {
+				throw RequestError.sessionBusy(`ACP subagent session cannot be forked: ${sessionId}`, {
+					reason: "subagent_read_only",
+				});
+			}
 			if (isPromptTurnInFlight(loaded.promptTurn)) {
 				throw new Error(`ACP session fork is unavailable while a prompt is in progress: ${sessionId}`);
 			}
@@ -1454,6 +1604,9 @@ export class AcpAgent implements Agent {
 		}
 		if (event.type === "tool_execution_end") {
 			record.toolArgsById.delete(event.toolCallId);
+			if (event.toolName === "task") {
+				await record.subagentBridge?.recordTaskResults(record.session, record.wireSessionId, event.result);
+			}
 		}
 		this.#clearLiveAssistantMessageAfterEvent(record, event);
 
@@ -2209,7 +2362,13 @@ export class AcpAgent implements Agent {
 
 	async #listStoredSessions(cwd?: string): Promise<StoredSessionInfo[]> {
 		const sessions = cwd ? await SessionManager.list(cwd) : await SessionManager.listAll();
-		return sessions.sort((left, right) => right.modified.getTime() - left.modified.getTime());
+		const roots = sessions.filter(session => {
+			for (const bridge of this.#subagentBridges) {
+				if (bridge.isSubagentSession(session.id)) return false;
+			}
+			return true;
+		});
+		return roots.sort((left, right) => right.modified.getTime() - left.modified.getTime());
 	}
 
 	async #findStoredSession(sessionId: string, cwd: string): Promise<StoredSessionInfo | undefined> {
@@ -2246,9 +2405,11 @@ export class AcpAgent implements Agent {
 		const cwd = record.session.sessionManager.getCwd();
 		const replayedToolCallIds = new Set<string>();
 		const replayedToolCallArgs = new Map<string, unknown>();
-		for (const message of record.session.sessionManager.buildSessionContext().messages as ReplayableMessage[]) {
+		const messages =
+			record.replayMessages ?? (record.session.sessionManager.buildSessionContext().messages as ReplayableMessage[]);
+		for (const message of messages) {
 			for (const notification of this.#messageToReplayNotifications(
-				record.session.sessionId,
+				record.wireSessionId,
 				message,
 				cwd,
 				replayedToolCallIds,
@@ -2256,7 +2417,11 @@ export class AcpAgent implements Agent {
 			)) {
 				await this.#connection.sessionUpdate(notification);
 			}
+			if (message.role === "toolResult" && message.toolName === "task") {
+				await record.subagentBridge?.recordTaskResults(record.session, record.wireSessionId, message.details);
+			}
 		}
+		record.replayMessages = undefined;
 	}
 
 	#messageToReplayNotifications(
@@ -2723,8 +2888,34 @@ export class AcpAgent implements Agent {
 	async #closeManagedSession(sessionId: string, record: ManagedSessionRecord): Promise<void> {
 		record.closedError ??= this.#createPromptLifecycleError("ACP session closed before queued prompt could run");
 		this.#sessions.delete(sessionId);
+		if (record.ownsSubagentBridge && record.subagentBridge) {
+			await this.#evictBridgeChildren(record.subagentBridge);
+		}
+		if (record.ownership === "borrowed") {
+			record.lifetimeUnsubscribe?.();
+			record.subagentBridge?.detachBorrowed(sessionId);
+			return;
+		}
 		await this.#cancelPromptForClose(record);
 		await this.#disposeSessionRecord(record);
+	}
+
+	async #evictBridgeChildren(bridge: AcpSubagentBridge): Promise<void> {
+		const children: Array<[string, ManagedSessionRecord]> = [];
+		for (const [sessionId, candidate] of this.#sessions) {
+			if (candidate.subagentBridge !== bridge || candidate.ownsSubagentBridge) continue;
+			this.#sessions.delete(sessionId);
+			candidate.closedError ??= this.#createPromptLifecycleError(
+				"ACP parent session closed before child session could finish",
+			);
+			children.push([sessionId, candidate]);
+		}
+		await Promise.all(
+			children.map(async ([_sessionId, child]) => {
+				await this.#cancelPromptForClose(child);
+				await this.#disposeSessionRecord(child);
+			}),
+		);
 	}
 
 	async #cancelPromptForClose(record: ManagedSessionRecord): Promise<void> {
@@ -2742,6 +2933,14 @@ export class AcpAgent implements Agent {
 
 	async #disposeSessionRecord(record: ManagedSessionRecord, reason?: postmortem.Reason): Promise<void> {
 		record.lifetimeUnsubscribe?.();
+		if (record.ownership === "borrowed") {
+			record.subagentBridge?.detachBorrowed(record.wireSessionId);
+			return;
+		}
+		if (record.ownsSubagentBridge && record.subagentBridge) {
+			this.#subagentBridges.delete(record.subagentBridge);
+			await record.subagentBridge.dispose();
+		}
 		if (record.mcpManager) {
 			try {
 				await record.mcpManager.disconnectAll();

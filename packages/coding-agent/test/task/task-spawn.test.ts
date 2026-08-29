@@ -13,15 +13,37 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
+import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { type AsyncJob, AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
+import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
+import type {
+	AgentSession,
+	AgentSessionEvent,
+	PromptOptions,
+	SubagentSessionReadyHandler,
+} from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
+import type { ExecutorOptions } from "@oh-my-pi/pi-coding-agent/task/executor";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
-import type { AgentDefinition, SingleResult, TaskParams } from "@oh-my-pi/pi-coding-agent/task/types";
+import {
+	type AgentDefinition,
+	type AgentProgress,
+	type SingleResult,
+	type SubagentLifecyclePayload,
+	TASK_SUBAGENT_LIFECYCLE_CHANNEL,
+	type TaskParams,
+} from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import { TempDir } from "@oh-my-pi/pi-utils";
 
 const taskAgent: AgentDefinition = {
 	name: "task",
@@ -81,6 +103,151 @@ async function pollUntil(predicate: () => boolean, timeoutMs = 2000): Promise<vo
 		if (Date.now() - start > timeoutMs) throw new Error("pollUntil timed out");
 		await Bun.sleep(5);
 	}
+}
+
+interface MutableSessionIdentity {
+	sessionId: string;
+	sessionFile: string;
+}
+
+interface ExecutorSessionOptions {
+	agentId: string;
+	identity: MutableSessionIdentity;
+	order?: string[];
+	promptLabel?: string;
+	onPrompt?: (identity: MutableSessionIdentity) => void | Promise<void>;
+}
+
+function createAssistantStopMessage(text: string): AssistantMessage {
+	return {
+		role: "assistant",
+		content: [{ type: "text", text }],
+		api: "openai-responses",
+		provider: "openai",
+		model: "mock",
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp: Date.now(),
+	};
+}
+
+function createExecutorModelRegistry(): ModelRegistry {
+	return {
+		authStorage: undefined,
+		refresh: async () => {},
+		getAvailable: () => [],
+	} as unknown as ModelRegistry;
+}
+
+function createExecutorSession(options: ExecutorSessionOptions): AgentSession {
+	const listeners: Array<(event: AgentSessionEvent) => void> = [];
+	const messages: AssistantMessage[] = [];
+	let readyHandler: SubagentSessionReadyHandler | undefined;
+	const emit = (event: AgentSessionEvent): void => {
+		for (const listener of listeners) listener(event);
+	};
+	const settings = Settings.isolated({
+		"async.enabled": false,
+		"task.isolation.mode": "none",
+		"task.maxRecursionDepth": 4,
+		"task.softRequestBudget": 0,
+	});
+	const modelRegistry = createExecutorModelRegistry();
+	return {
+		cwd: "/tmp",
+		hasUI: false,
+		settings,
+		modelRegistry,
+		enableLsp: false,
+		enableIrc: false,
+		state: { messages },
+		agent: { state: { systemPrompt: [taskAgent.systemPrompt] } },
+		model: undefined,
+		extensionRunner: undefined,
+		sessionManager: {
+			appendSessionInit: () => {},
+			getSessionId: () => options.identity.sessionId,
+			getSessionFile: () => options.identity.sessionFile,
+		},
+		getSessionFile: () => null,
+		getSessionId: () => options.identity.sessionId,
+		getArtifactsDir: () => null,
+		getSessionSpawns: () => "*",
+		getAgentId: () => options.agentId,
+		getActiveToolNames: () => ["task", "yield"],
+		getEnabledToolNames: () => ["task", "yield"],
+		setActiveToolsByName: async () => {},
+		subscribe: (listener: (event: AgentSessionEvent) => void) => {
+			listeners.push(listener);
+			return () => {
+				const index = listeners.indexOf(listener);
+				if (index >= 0) listeners.splice(index, 1);
+			};
+		},
+		prompt: async (_text: string, _promptOptions?: PromptOptions) => {
+			options.order?.push(`prompt:${options.promptLabel ?? options.agentId}`);
+			await options.onPrompt?.(options.identity);
+			messages.push(createAssistantStopMessage("done"));
+			emit({
+				type: "tool_execution_end",
+				toolCallId: `yield-${options.agentId}`,
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+		},
+		waitForIdle: async () => {},
+		prepareForHeadlessAdvisorDrain: () => {},
+		waitForAdvisorCatchup: async () => true,
+		getLastAssistantMessage: () => messages[messages.length - 1],
+		abort: async () => {},
+		dispose: async () => {},
+		setIrcWakeTurnObserver: () => {},
+		subscribeRunState: () => () => {},
+		installSubagentSessionReadyHandler: (handler: SubagentSessionReadyHandler | undefined) => {
+			readyHandler = handler;
+		},
+		getSubagentSessionReadyHandler: () => readyHandler,
+	} as unknown as AgentSession;
+}
+
+function createExecutorSessionResult(session: AgentSession): CreateAgentSessionResult {
+	return {
+		session,
+		extensionsResult: {} as unknown as LoadExtensionsResult,
+		setToolUIContext: () => {},
+		eventBus: new EventBus(),
+	};
+}
+
+function createExecutorOptions(id: string, overrides: Partial<ExecutorOptions> = {}): ExecutorOptions {
+	return {
+		cwd: "/tmp",
+		agent: taskAgent,
+		task: "Do the thing.",
+		assignment: "Do the thing.",
+		description: id,
+		invocationKind: "task",
+		index: 0,
+		id,
+		settings: Settings.isolated({ "task.softRequestBudget": 0 }),
+		modelRegistry: createExecutorModelRegistry(),
+		enableLsp: false,
+		enableIrc: false,
+		enableMCP: false,
+		keepAlive: false,
+		...overrides,
+	};
 }
 
 describe("task spawn routing", () => {
@@ -589,4 +756,317 @@ describe("task spawn routing", () => {
 		gates.get("Fifth")!.resolve();
 		await Promise.all(jobs.map(job => job.promise));
 	});
+});
+
+describe("subagent session readiness", () => {
+	beforeEach(() => {
+		AgentRegistry.resetGlobalForTests();
+		AgentLifecycleManager.resetGlobalForTests();
+	});
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+		AgentLifecycleManager.resetGlobalForTests();
+		AgentRegistry.resetGlobalForTests();
+	});
+
+	it("blocks the first prompt until readiness and preserves the created session identifiers", async () => {
+		const order: string[] = [];
+		const identity: MutableSessionIdentity = {
+			sessionId: "persisted-session",
+			sessionFile: "/tmp/persisted-session.jsonl",
+		};
+		const session = createExecutorSession({
+			agentId: "ReadyChild",
+			identity,
+			order,
+			promptLabel: "child",
+			onPrompt: current => {
+				current.sessionId = "mutated-session";
+				current.sessionFile = "/tmp/mutated-session.jsonl";
+			},
+		});
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createExecutorSessionResult(session));
+
+		const readinessEntered = deferred();
+		const readinessReleased = deferred();
+		const progress: AgentProgress[] = [];
+		const lifecycle: SubagentLifecyclePayload[] = [];
+		const eventBus = new EventBus();
+		eventBus.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, payload => {
+			lifecycle.push(payload as SubagentLifecyclePayload);
+		});
+		let readyAgentId: string | undefined;
+		let readyParentAgentId: string | undefined;
+		let readyParentToolCallId: string | undefined;
+		const run = executorModule.runSubprocess(
+			createExecutorOptions("ReadyChild", {
+				parentAgentId: "Main",
+				parentToolCallId: "tool-parent",
+				eventBus,
+				onProgress: current => progress.push(current),
+				onSubagentSessionReady: async context => {
+					readyAgentId = context.agentId;
+					readyParentAgentId = context.parentAgentId;
+					readyParentToolCallId = context.parentToolCallId;
+					order.push("ready");
+					readinessEntered.resolve();
+					await readinessReleased.promise;
+				},
+			}),
+		);
+
+		await readinessEntered.promise;
+		await Promise.resolve();
+		expect(order).toEqual(["ready"]);
+		expect(readyAgentId).toBe("ReadyChild");
+		expect(readyParentAgentId).toBe("Main");
+		expect(readyParentToolCallId).toBe("tool-parent");
+
+		readinessReleased.resolve();
+		const result = await run;
+
+		expect(order).toEqual(["ready", "prompt:child"]);
+		expect(result.sessionId).toBe("persisted-session");
+		expect(result.sessionFile).toBe("/tmp/persisted-session.jsonl");
+		expect(progress.at(-1)?.sessionId).toBe("persisted-session");
+		expect(lifecycle.map(payload => payload.status)).toEqual(["started", "completed"]);
+		expect(lifecycle.every(payload => payload.sessionId === "persisted-session")).toBe(true);
+		expect(lifecycle.every(payload => payload.sessionFile === "/tmp/persisted-session.jsonl")).toBe(true);
+	});
+
+	it("delegates a readiness handler installed after the SDK task tool is constructed", async () => {
+		using tempDir = TempDir.createSync("@pi-task-sdk-readiness-");
+		const authStorage = await AuthStorage.create(tempDir.join("auth.db"));
+		const modelRegistry = new ModelRegistry(authStorage, tempDir.join("models.yml"));
+		const { session: parentSession, subagentEventBus } = await sdkModule.createAgentSession({
+			cwd: tempDir.path(),
+			agentDir: tempDir.path(),
+			authStorage,
+			modelRegistry,
+			settings: Settings.isolated({
+				"async.enabled": false,
+				"task.isolation.mode": "none",
+				"task.maxRecursionDepth": 4,
+				"task.softRequestBudget": 0,
+			}),
+			disableExtensionDiscovery: true,
+			extensions: [],
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			toolNames: ["task"],
+			restrictToolNames: true,
+			agentId: "Main",
+		});
+
+		try {
+			const taskTool = parentSession.getToolByName("task");
+			if (!taskTool) throw new Error("Expected SDK-created task tool");
+
+			vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+				agents: [taskAgent],
+				projectAgentsDir: null,
+			});
+			const order: string[] = [];
+			const identity: MutableSessionIdentity = {
+				sessionId: "sdk-child-session",
+				sessionFile: "/tmp/sdk-child-session.jsonl",
+			};
+			const promptEntered = deferred();
+			const promptReleased = deferred();
+			const childSession = createExecutorSession({
+				agentId: "ReadyChild",
+				identity,
+				order,
+				promptLabel: "child",
+				onPrompt: async current => {
+					current.sessionId = "mutated-child-session";
+					current.sessionFile = "/tmp/mutated-child-session.jsonl";
+					promptEntered.resolve();
+					await promptReleased.promise;
+				},
+			});
+			vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createExecutorSessionResult(childSession));
+			if (!subagentEventBus) throw new Error("Expected SDK subagent event bus");
+			const lifecycleStatuses: string[] = [];
+			const lifecycleSessionIds: Array<string | undefined> = [];
+			const lifecycleSessionFiles: Array<string | undefined> = [];
+			subagentEventBus.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, payload => {
+				if (typeof payload !== "object" || payload === null) return;
+				const status = Reflect.get(payload, "status");
+				if (typeof status !== "string") return;
+				const sessionId = Reflect.get(payload, "sessionId");
+				const sessionFile = Reflect.get(payload, "sessionFile");
+				lifecycleStatuses.push(status);
+				lifecycleSessionIds.push(typeof sessionId === "string" ? sessionId : undefined);
+				lifecycleSessionFiles.push(typeof sessionFile === "string" ? sessionFile : undefined);
+			});
+			const emittedProgress: AgentProgress[] = [];
+
+			const readinessEntered = deferred();
+			const readinessReleased = deferred();
+			let readySessionId: string | undefined;
+			let readySession: AgentSession | undefined;
+			let readyParentToolCallId: string | undefined;
+			let cancelChild: (() => void) | undefined;
+			parentSession.installSubagentSessionReadyHandler(async context => {
+				readySessionId = context.session.sessionManager.getSessionId();
+				readySession = context.session;
+				readyParentToolCallId = context.parentToolCallId;
+				cancelChild = context.cancel;
+				order.push("ready");
+				readinessEntered.resolve();
+				await readinessReleased.promise;
+			});
+
+			const execution = taskTool.execute(
+				"sdk-parent-tool-call",
+				{
+					agent: "task",
+					name: "ReadyChild",
+					task: "Do the thing.",
+					isolated: false,
+				} satisfies TaskParams,
+				undefined,
+				update => {
+					const current = update.details?.progress?.[0];
+					if (current) emittedProgress.push(current);
+				},
+			);
+
+			let executionSettled = false;
+			try {
+				const firstBoundary = await Promise.race([
+					readinessEntered.promise.then(() => "ready" as const),
+					promptEntered.promise.then(() => "prompt" as const),
+				]);
+				expect(firstBoundary).toBe("ready");
+				expect(order).toEqual(["ready"]);
+				expect(readySessionId).toBe("sdk-child-session");
+				expect(readySession).toBe(childSession);
+				expect(readyParentToolCallId).toBe("sdk-parent-tool-call");
+
+				readinessReleased.resolve();
+				await promptEntered.promise;
+				expect(order).toEqual(["ready", "prompt:child"]);
+				expect(identity.sessionId).toBe("mutated-child-session");
+				expect(readySessionId).toBe("sdk-child-session");
+
+				if (!cancelChild) throw new Error("Expected executor-owned child cancel callback");
+				cancelChild();
+				promptReleased.resolve();
+				const toolResult = await execution;
+				executionSettled = true;
+				const childResult = toolResult.details?.results[0];
+				expect(childResult?.aborted).toBe(true);
+				expect(childResult?.abortReason).toBe("Cancelled by caller");
+				expect(childResult?.sessionId).toBe("sdk-child-session");
+				expect(childResult?.sessionFile).toBe("/tmp/sdk-child-session.jsonl");
+				expect(emittedProgress.at(-1)?.status).toBe("aborted");
+				expect(emittedProgress.at(-1)?.sessionId).toBe("sdk-child-session");
+				expect(lifecycleStatuses).toEqual(["started", "aborted"]);
+				expect(lifecycleSessionIds).toEqual(["sdk-child-session", "sdk-child-session"]);
+				expect(lifecycleSessionFiles).toEqual(["/tmp/sdk-child-session.jsonl", "/tmp/sdk-child-session.jsonl"]);
+			} finally {
+				readinessReleased.resolve();
+				promptReleased.resolve();
+				if (!executionSettled) await execution.catch(() => undefined);
+			}
+		} finally {
+			await parentSession.dispose();
+			authStorage.close();
+		}
+	});
+
+	it("inherits the readiness handler for a nested task dispatch", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: [taskAgent],
+			projectAgentsDir: null,
+		});
+		const order: string[] = [];
+		const outerSession = createExecutorSession({
+			agentId: "Outer",
+			identity: { sessionId: "outer-session", sessionFile: "/tmp/outer-session.jsonl" },
+			order,
+			promptLabel: "outer",
+		});
+		const nestedSession = createExecutorSession({
+			agentId: "Nested",
+			identity: { sessionId: "nested-session", sessionFile: "/tmp/nested-session.jsonl" },
+			order,
+			promptLabel: "nested",
+		});
+		const sessions = [outerSession, nestedSession];
+		let createdCount = 0;
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async () => {
+			const next = sessions[createdCount++];
+			if (!next) throw new Error("Unexpected child session creation");
+			return createExecutorSessionResult(next);
+		});
+
+		let nestedResult: SingleResult | undefined;
+		const handler: SubagentSessionReadyHandler = async context => {
+			order.push(`ready:${context.parentAgentId}->${context.agentId}`);
+			if (context.agentId !== "Outer") return;
+			const nestedTool = await TaskTool.create(context.session as unknown as ToolSession);
+			const toolResult = await nestedTool.execute("nested-tool-call", {
+				agent: "task",
+				name: "Nested",
+				task: "Do the thing.",
+			} as TaskParams);
+			nestedResult = toolResult.details?.results[0];
+		};
+
+		await executorModule.runSubprocess(
+			createExecutorOptions("Outer", {
+				parentAgentId: "Main",
+				parentToolCallId: "outer-tool-call",
+				onSubagentSessionReady: handler,
+			}),
+		);
+
+		expect(order).toEqual(["ready:Main->Outer", "ready:Outer->Nested", "prompt:nested", "prompt:outer"]);
+		expect(nestedResult?.sessionId).toBe("nested-session");
+		expect(nestedResult?.sessionFile).toBe("/tmp/nested-session.jsonl");
+	});
+
+	for (const scenario of [
+		{ name: "eval one-shot", invocationKind: "eval" as const, worktree: undefined },
+		{ name: "isolated task", invocationKind: "task" as const, worktree: "/tmp/isolated-child" },
+	]) {
+		it(`bypasses readiness for an ${scenario.name}`, async () => {
+			const order: string[] = [];
+			const identity: MutableSessionIdentity = {
+				sessionId: `${scenario.invocationKind}-session`,
+				sessionFile: `/tmp/${scenario.invocationKind}-session.jsonl`,
+			};
+			const session = createExecutorSession({
+				agentId: "BypassChild",
+				identity,
+				order,
+				promptLabel: scenario.name,
+			});
+			vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createExecutorSessionResult(session));
+			let readinessCalls = 0;
+
+			const result = await executorModule.runSubprocess(
+				createExecutorOptions("BypassChild", {
+					invocationKind: scenario.invocationKind,
+					worktree: scenario.worktree,
+					onSubagentSessionReady: () => {
+						readinessCalls += 1;
+					},
+				}),
+			);
+
+			expect(readinessCalls).toBe(0);
+			expect(order).toEqual([`prompt:${scenario.name}`]);
+			expect(result.sessionId).toBe(identity.sessionId);
+			expect(result.sessionFile).toBe(identity.sessionFile);
+		});
+	}
 });

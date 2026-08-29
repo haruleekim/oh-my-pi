@@ -41,6 +41,13 @@ import type { XdevState } from "../tools/xdev";
 import type { CodexAutoRedeemCoordinator } from "./codex-auto-reset";
 import type { SessionManager } from "./session-manager";
 
+declare module "@oh-my-pi/pi-agent-core" {
+	interface AgentToolContext {
+		/** The outer ACP permission gate approved this exact execute input. */
+		acpApproved?: boolean;
+	}
+}
+
 /** Maximum time the interactive shutdown path waits for Mnemopi consolidation. */
 export const SHUTDOWN_CONSOLIDATE_BUDGET_MS = 1_500;
 

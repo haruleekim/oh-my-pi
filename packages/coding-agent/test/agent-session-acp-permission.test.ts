@@ -13,6 +13,8 @@ import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream"
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { type SettingPath, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { EditTool } from "@oh-my-pi/pi-coding-agent/edit";
+import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type {
 	ClientBridge,
@@ -187,6 +189,59 @@ it("allow_once: calls bridge once and executes the underlying tool", async () =>
 
 	expect(permissionSpy).toHaveBeenCalledTimes(1);
 	expect(bashTool.executeCalls).toBe(1);
+});
+
+it("allow_once bypasses one duplicate headless prompt at the real extension wrapper", async () => {
+	const model = getBundledModel("openai", "gpt-4o-mini");
+	if (!model) throw new Error("Expected gpt-4o-mini model to exist");
+	const settings = Settings.isolated({
+		"async.enabled": false,
+		"bash.autoBackground.enabled": false,
+		"bashInterceptor.enabled": false,
+		"tools.approvalMode": "always-ask",
+	});
+	const bridge = makeBridge({ outcome: "selected", optionId: "allow_once", kind: "allow_once" });
+	const permissionSpy = spyOn(bridge, "requestPermission");
+	const created = await createAgentSession({
+		cwd: tempDir.path(),
+		agentDir: tempDir.path(),
+		sessionManager: SessionManager.inMemory(tempDir.path()),
+		settings,
+		model,
+		disableExtensionDiscovery: true,
+		skills: [],
+		contextFiles: [],
+		promptTemplates: [],
+		slashCommands: [],
+		enableMCP: false,
+		enableLsp: false,
+		toolNames: ["bash"],
+	});
+	session = created.session;
+	const extensionWrappedBash = session.getToolByName("bash");
+	expect(extensionWrappedBash).toBeInstanceOf(ExtensionToolWrapper);
+	const runner = session.extensionRunner;
+	if (!runner) throw new Error("Expected extension runner");
+	const hasUISpy = spyOn(runner, "hasUI");
+
+	session.setClientBridge(bridge);
+	await session.setActiveToolsByName(["bash"]);
+	hasUISpy.mockClear();
+	const toolContext = session.buildAskReanswerContext(runner.getUIContext());
+	toolContext.hasUI = false;
+	const acpWrappedBash = session.agent.state.tools.find(tool => tool.name === "bash");
+	if (!acpWrappedBash) throw new Error("Expected ACP-wrapped bash tool");
+	const result = await acpWrappedBash.execute(
+		"call-real-wrapper",
+		{ command: "printf acp-wrapper-ok" },
+		undefined,
+		undefined,
+		toolContext,
+	);
+
+	expect(permissionSpy).toHaveBeenCalledTimes(1);
+	expect(hasUISpy).not.toHaveBeenCalled();
+	expect(result.content.find(part => part.type === "text")?.text).toContain("acp-wrapper-ok");
 });
 
 it("eval bridge dispatch uses the same ACP gate as a direct tool call", async () => {

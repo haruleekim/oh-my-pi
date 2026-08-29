@@ -22,10 +22,15 @@ import type {
 	ClientBridgeTerminalHandle,
 } from "../../session/client-bridge";
 
+interface AcpClientBridgeOptions {
+	deferAgentInitiatedTurns?: boolean;
+}
+
 export function createAcpClientBridge(
 	connection: AgentSideConnection,
 	sessionId: string,
 	clientCapabilities: ClientCapabilities | undefined,
+	options: AcpClientBridgeOptions = {},
 ): ClientBridge {
 	const capabilities: ClientBridgeCapabilities = {
 		readTextFile: clientCapabilities?.fs?.readTextFile === true,
@@ -36,7 +41,10 @@ export function createAcpClientBridge(
 		requestPermission: true,
 	};
 
-	const bridge: ClientBridge = { capabilities, deferAgentInitiatedTurns: true };
+	const bridge: ClientBridge = {
+		capabilities,
+		deferAgentInitiatedTurns: options.deferAgentInitiatedTurns ?? true,
+	};
 
 	if (capabilities.readTextFile) {
 		bridge.readTextFile = async params => {

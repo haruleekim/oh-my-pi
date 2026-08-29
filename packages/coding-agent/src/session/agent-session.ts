@@ -516,6 +516,18 @@ export function powerAssertionOptions(mode: "off" | "idle" | "display" | "system
 	};
 }
 
+export interface SubagentSessionReadyContext {
+	invocationKind: "task" | "eval";
+	agentId: string;
+	parentAgentId: string;
+	parentToolCallId?: string;
+	index: number;
+	isolated: boolean;
+	session: AgentSession;
+	cancel(): void;
+}
+
+export type SubagentSessionReadyHandler = (context: SubagentSessionReadyContext) => void | Promise<void>;
 export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
@@ -669,6 +681,7 @@ export class AgentSession {
 	// Agent identity (registry id) used for IRC routing and job ownership.
 	#agentId: string | undefined;
 	#agentKind: "main" | "sub" = "main";
+	#subagentSessionReadyHandler: SubagentSessionReadyHandler | undefined;
 	#scoutAllowedBySpawnPolicy = true;
 	#providerSessionId: string | undefined;
 	#freshProviderSessionId: string | undefined;
@@ -1864,6 +1877,14 @@ export class AgentSession {
 
 	getAgentId(): string | undefined {
 		return this.#agentId;
+	}
+
+	installSubagentSessionReadyHandler(handler: SubagentSessionReadyHandler | undefined): void {
+		this.#subagentSessionReadyHandler = handler;
+	}
+
+	getSubagentSessionReadyHandler(): SubagentSessionReadyHandler | undefined {
+		return this.#subagentSessionReadyHandler;
 	}
 
 	/** Dequeue the next HARD forced tool choice for the upcoming LLM call, dropping

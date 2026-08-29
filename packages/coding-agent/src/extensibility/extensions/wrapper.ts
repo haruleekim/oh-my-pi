@@ -263,8 +263,11 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		// them on the user's behalf.
 		const explicitPrompt = resolved.override || Object.hasOwn(userPolicies, resolved.policyKey ?? this.tool.name);
 		const xdevBypass = context?.xdevApproved === true && effectiveParams === params;
+		const acpBypass = context?.acpApproved === true && effectiveParams === params;
 		const approvalCheck = {
-			required: pendingSafetyChecks.length > 0 || (resolved.policy === "prompt" && (explicitPrompt || !xdevBypass)),
+			required:
+				pendingSafetyChecks.length > 0 ||
+				(resolved.policy === "prompt" && !acpBypass && (explicitPrompt || !xdevBypass)),
 			reason: resolved.reason,
 		};
 

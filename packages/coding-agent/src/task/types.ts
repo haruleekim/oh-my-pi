@@ -87,11 +87,14 @@ export interface SubagentEventPayload {
 /** Payload emitted on TASK_SUBAGENT_LIFECYCLE_CHANNEL */
 export interface SubagentLifecyclePayload {
 	id: string;
+	sessionId?: string;
 	agent: string;
 	agentSource: AgentSource;
 	description?: string;
 	status: "started" | "completed" | "failed" | "aborted";
 	sessionFile?: string;
+	error?: string;
+	abortReason?: string;
 	parentToolCallId?: string;
 	index: number;
 	/**
@@ -417,6 +420,7 @@ export interface YieldItem {
 export interface AgentProgress {
 	index: number;
 	id: string;
+	sessionId?: string;
 	agent: string;
 	agentSource: AgentSource;
 	status: "pending" | "running" | "completed" | "failed" | "aborted";
@@ -493,6 +497,9 @@ export interface AgentProgress {
 export interface SingleResult {
 	index: number;
 	id: string;
+	sessionId?: string;
+	sessionFile?: string;
+	isIsolated?: boolean;
 	agent: string;
 	agentSource: AgentSource;
 	task: string;

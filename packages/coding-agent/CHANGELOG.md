@@ -345,6 +345,7 @@
 - Fixed a macOS composer display issue where undercurl could remain attached to stale text after rapid typing.
 - Improved `xd://` MCP failure messages with actionable transport stages, failure categories, server and tool context, retryability, trace IDs, and redacted JSON-RPC details.
 - Fixed ACP `read` tool-call locations so clients such as Zed Follow receive the resolved filesystem path rather than the OMP line-range selector.
+- Added live, nested, cancellable OMP task sessions to supporting ACP clients, including child-scoped permissions and transcript replay.
 
 ## [18.0.9] - 2026-08-28
 

@@ -369,6 +369,7 @@ export async function submitInteractiveInput(
 interface AcpSessionHandle {
 	session: AgentSession;
 	setToolUIContext: (uiContext: ExtensionUIContext, hasUI: boolean) => void;
+	subagentEventBus: EventBus;
 }
 
 type AcpSessionFactory = (cwd: string, options?: { interactivePrompts?: boolean }) => Promise<AcpSessionHandle>;
@@ -427,6 +428,7 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 		const titleSystemPromptSource = discoverTitleSystemPromptFile(cwd);
 		const titleSystemPrompt = await resolvePromptInput(titleSystemPromptSource, "title system prompt");
 		const eventBus = new EventBus();
+		const subagentEventBus = new EventBus();
 		const trustedExtensions =
 			args.parsedArgs.trustedExtensions && args.parsedArgs.trustedExtensions.length > 0
 				? await loadTrustedSessionExtensions(args.baseOptions, cwd, eventBus)
@@ -451,6 +453,7 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 			enableMCP: false,
 			titleSystemPrompt,
 			eventBus,
+			subagentEventBus,
 			preloadedExtensions: trustedExtensions,
 		});
 		if (args.parsedArgs.apiKey && !args.baseOptions.model && nextSession.model) {
@@ -477,7 +480,7 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 				throw error;
 			}
 		}
-		return { session: nextSession, setToolUIContext };
+		return { session: nextSession, setToolUIContext, subagentEventBus };
 	};
 }
 
