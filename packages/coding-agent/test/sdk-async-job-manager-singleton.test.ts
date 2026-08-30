@@ -3,10 +3,14 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
-import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
+import { AsyncJobManager, createSessionAsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { createAgentSession, type ExtensionFactory } from "@oh-my-pi/pi-coding-agent/sdk";
+import {
+	type CreateAgentSessionOptions,
+	createAgentSession,
+	type ExtensionFactory,
+} from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AsyncJobSnapshot } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
@@ -40,7 +44,11 @@ describe("AsyncJobManager singleton across concurrent top-level sessions", () =>
 		AsyncJobManager.resetForTests();
 	});
 
-	async function spawnTopLevelSession(extraSettings?: Record<string, unknown>, extensions: ExtensionFactory[] = []) {
+	async function spawnTopLevelSession(
+		extraSettings?: Record<string, unknown>,
+		extensions: ExtensionFactory[] = [],
+		sessionOptions: Pick<CreateAgentSessionOptions, "asyncJobManager"> = {},
+	) {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-sdk-async-singleton-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
 		const cwd = path.join(tempDir, `project-${Snowflake.next()}`);
@@ -59,9 +67,63 @@ describe("AsyncJobManager singleton across concurrent top-level sessions", () =>
 			enableMCP: false,
 			enableLsp: false,
 			modelRegistry: sharedModelRegistry,
+			...sessionOptions,
 		});
 		return session;
 	}
+
+	function registerHeldJobs(manager: AsyncJobManager, count: number): void {
+		for (let index = 0; index < count; index++) {
+			manager.register("bash", `held-${index}`, async ({ signal }) => {
+				if (signal.aborted) return "aborted";
+				const stopped = Promise.withResolvers<void>();
+				signal.addEventListener("abort", () => stopped.resolve(), { once: true });
+				await stopped.promise;
+				return "aborted";
+			});
+		}
+	}
+
+	it("clamps explicit session manager limits to the public range", async () => {
+		const minimum = createSessionAsyncJobManager(0);
+		const defaultLimit = createSessionAsyncJobManager(undefined);
+		const maximum = createSessionAsyncJobManager(101);
+		try {
+			registerHeldJobs(minimum, 1);
+			expect(minimum.atCapacity).toBe(true);
+
+			registerHeldJobs(defaultLimit, 99);
+			expect(defaultLimit.atCapacity).toBe(false);
+			registerHeldJobs(defaultLimit, 1);
+			expect(defaultLimit.atCapacity).toBe(true);
+
+			registerHeldJobs(maximum, 100);
+			expect(maximum.atCapacity).toBe(true);
+		} finally {
+			await Promise.all([
+				minimum.dispose({ timeoutMs: 1_000 }),
+				defaultLimit.dispose({ timeoutMs: 1_000 }),
+				maximum.dispose({ timeoutMs: 1_000 }),
+			]);
+		}
+	});
+
+	it("keeps an explicitly supplied manager scoped and caller-owned", async () => {
+		const manager = createSessionAsyncJobManager(2);
+		const session = await spawnTopLevelSession({ "async.enabled": true }, [], { asyncJobManager: manager });
+		try {
+			expect(AsyncJobManager.instance()).toBeUndefined();
+			expect(session.getAsyncJobSnapshot()).not.toBeNull();
+
+			await session.dispose();
+			const jobId = manager.register("bash", "caller-owned", async () => "completed");
+			await manager.waitForAll();
+			expect(manager.getJob(jobId)?.status).toBe("completed");
+		} finally {
+			await session.dispose();
+			await manager.dispose({ timeoutMs: 1_000 });
+		}
+	}, 60000);
 
 	it("keeps the primary session's manager installed after a secondary session disposes", async () => {
 		const primary = await spawnTopLevelSession();

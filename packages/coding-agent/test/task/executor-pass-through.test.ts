@@ -21,6 +21,7 @@ import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/p
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import { mockSubagentSessionSurface } from "../helpers/subagent-session-surface";
 
 function createMockSession(onPrompt: (params: { emit: (event: AgentSessionEvent) => void }) => void): AgentSession {
 	const listeners: Array<(event: AgentSessionEvent) => void> = [];
@@ -32,7 +33,7 @@ function createMockSession(onPrompt: (params: { emit: (event: AgentSessionEvent)
 		agent: { state: { systemPrompt: ["test"] } },
 		model: undefined,
 		extensionRunner: undefined,
-		sessionManager: { appendSessionInit: () => {} },
+		...mockSubagentSessionSurface(),
 		getActiveToolNames: () => ["read", "yield"],
 		getEnabledToolNames: () => ["read", "yield"],
 		setActiveToolsByName: async (_toolNames: string[]) => {},

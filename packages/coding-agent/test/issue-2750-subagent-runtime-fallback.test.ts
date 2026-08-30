@@ -7,6 +7,7 @@ import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-sessi
 import type { ServingModel } from "@oh-my-pi/pi-coding-agent/session/retry-fallback-chains";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
+import { mockSubagentSessionSurface } from "./helpers/subagent-session-surface";
 
 function model(provider: string, id: string): Model<Api> {
 	return buildModel({
@@ -44,7 +45,7 @@ function createYieldingSession(fallback: "served" | "unproven" = "served"): Agen
 		model: model("primary", "bad-runtime-model"),
 		servingModel: { selector: "primary/bad-runtime-model", isFallback: false } as ServingModel | undefined,
 		extensionRunner: undefined,
-		sessionManager: { appendSessionInit: () => {} },
+		...mockSubagentSessionSurface(),
 		getActiveToolNames: () => ["yield"],
 		getEnabledToolNames: () => ["yield"],
 		setActiveToolsByName: async () => {},

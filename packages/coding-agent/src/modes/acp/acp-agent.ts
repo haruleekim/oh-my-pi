@@ -2,7 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { AgentBusyError, type AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai";
-import { getBlobsDir, isEnoent, logger, type postmortem, VERSION } from "@oh-my-pi/pi-utils";
+import { getBlobsDir, isEnoent, isRecord, logger, type postmortem, VERSION } from "@oh-my-pi/pi-utils";
 import {
 	type Agent,
 	type AgentSideConnection,
@@ -44,6 +44,7 @@ import {
 	type SetSessionModeResponse,
 	type Usage,
 } from "@oh-my-pi/pi-utils/acp";
+import type { AsyncJobManager } from "../../async";
 import { disableProvider, enableProvider, reset as resetCapabilities } from "../../capability";
 import { Settings } from "../../config/settings";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
@@ -63,6 +64,7 @@ import { loadAllExtensions } from "../../modes/components/extensions/state-manag
 import { theme } from "../../modes/theme/theme";
 import { normalizePlanTitle, type PlanApprovalDetails, resolveApprovedPlan } from "../../plan-mode/approved-plan";
 import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
+import { ASYNC_RESULT_MESSAGE_TYPE } from "../../session/async-job-delivery";
 import { BlobStore, resolveImageDataSync } from "../../session/blob-store";
 import { isSilentAbort, SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
 import type { UsageStatistics } from "../../session/session-entries";
@@ -200,6 +202,7 @@ interface PreparedSessionOptions {
 
 type ReplayableMessage = {
 	role: string;
+	customType?: string;
 	content?: unknown;
 	errorMessage?: string;
 	toolCallId?: string;
@@ -630,6 +633,7 @@ export class AcpAgent implements Agent {
 	#connection: AgentSideConnection;
 	#initialSession: AgentSession | undefined;
 	#createSession: CreateAcpSession;
+	#asyncJobManager: AsyncJobManager | undefined;
 	#sessions = new Map<string, ManagedSessionRecord>();
 	#subagentBridges = new Set<AcpSubagentBridge>();
 	#disposePromise: Promise<void> | undefined;
@@ -639,10 +643,16 @@ export class AcpAgent implements Agent {
 	#cancelCleanupTimeoutMs = ACP_CANCEL_CLEANUP_TIMEOUT_MS;
 	#blobs = new BlobStore(getBlobsDir());
 
-	constructor(connection: AgentSideConnection, createSession: CreateAcpSession, initialSession?: AgentSession) {
+	constructor(
+		connection: AgentSideConnection,
+		createSession: CreateAcpSession,
+		initialSession?: AgentSession,
+		asyncJobManager?: AsyncJobManager,
+	) {
 		this.#connection = connection;
 		this.#initialSession = initialSession;
 		this.#createSession = createSession;
+		this.#asyncJobManager = asyncJobManager;
 	}
 
 	setCancelCleanupTimeoutForTesting(timeoutMs: number): void {
@@ -2420,6 +2430,17 @@ export class AcpAgent implements Agent {
 			if (message.role === "toolResult" && message.toolName === "task") {
 				await record.subagentBridge?.recordTaskResults(record.session, record.wireSessionId, message.details);
 			}
+			if (
+				message.role === "custom" &&
+				message.customType === ASYNC_RESULT_MESSAGE_TYPE &&
+				isRecord(message.details) &&
+				Array.isArray(message.details.jobs)
+			) {
+				for (const job of message.details.jobs) {
+					if (!isRecord(job) || !isRecord(job.details)) continue;
+					await record.subagentBridge?.recordTaskResults(record.session, record.wireSessionId, job.details);
+				}
+			}
 		}
 		record.replayMessages = undefined;
 	}
@@ -2992,6 +3013,12 @@ export class AcpAgent implements Agent {
 			this.#initialSession = undefined;
 			if (initialSession) {
 				await this.#disposeStandaloneSession(initialSession, reason);
+			}
+
+			const asyncJobManager = this.#asyncJobManager;
+			this.#asyncJobManager = undefined;
+			if (asyncJobManager) {
+				await asyncJobManager.dispose();
 			}
 		})();
 

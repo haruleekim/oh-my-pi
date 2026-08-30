@@ -23,6 +23,7 @@ import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition, SingleResult } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import { mockSubagentSessionSurface } from "../helpers/subagent-session-surface";
 
 function yieldEmittingSession(
 	initialTools: string[] = ["read", "yield"],
@@ -40,7 +41,7 @@ function yieldEmittingSession(
 		model: modelSwitch?.from,
 		servingModel: serving(modelSwitch?.from),
 		extensionRunner: undefined,
-		sessionManager: { appendSessionInit: () => {} },
+		...mockSubagentSessionSurface(),
 		getActiveToolNames: () => activeTools,
 		getEnabledToolNames: () => activeTools,
 		getAllToolNames: () => activeTools,

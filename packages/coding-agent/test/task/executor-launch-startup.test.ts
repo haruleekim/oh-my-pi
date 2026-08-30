@@ -9,6 +9,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { mockSubagentSessionSurface } from "../helpers/subagent-session-surface";
 
 const authStorages: AuthStorage[] = [];
 const tempDirs: TempDir[] = [];
@@ -44,7 +45,7 @@ it("overlaps registry refresh with session-file opening and session setup", asyn
 		agent: { state: { systemPrompt: ["test"] } },
 		model: undefined,
 		extensionRunner: undefined,
-		sessionManager: { appendSessionInit: () => {} },
+		...mockSubagentSessionSurface(),
 		getActiveToolNames: () => ["yield"],
 		getEnabledToolNames: () => ["yield"],
 		setActiveToolsByName: async () => {},

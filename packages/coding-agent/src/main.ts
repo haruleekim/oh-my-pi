@@ -23,6 +23,7 @@ import {
 	VERSION,
 } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
+import { type AsyncJobManager, createSessionAsyncJobManager } from "./async";
 import { reset as resetCapabilities } from "./capability";
 import { type Args, reportUnrecognizedFlags, validateToolNames } from "./cli/args";
 import { applyExtensionFlags, type ExtensionFlagSink } from "./cli/extension-flags";
@@ -62,6 +63,7 @@ import { scheduleMarketplaceAutoUpdate } from "./extensibility/plugins/marketpla
 import { registerDaemonProjectPresence } from "./launch/presence";
 import { discoverStartupLspServers } from "./lsp/servers";
 import type { MCPManager } from "./mcp";
+import type { AcpConnectionOptions } from "./modes/acp/acp-mode";
 import { InteractiveMode } from "./modes/interactive-mode";
 import type { PrintModeOptions } from "./modes/print-mode";
 import { claimRpcInput } from "./modes/rpc/rpc-input";
@@ -109,7 +111,7 @@ import type { LspStartupServerInfo } from "./tools";
 import { getChangelogPath, resolveStartupChangelogForDisplay, type StartupChangelogSelection } from "./utils/changelog";
 import { EventBus } from "./utils/event-bus";
 
-type RunAcpMode = (createSession: AcpSessionFactory) => Promise<never>;
+type RunAcpMode = (createSession: AcpSessionFactory, options?: AcpConnectionOptions) => Promise<never>;
 type RunPrintMode = (session: AgentSession, options: PrintModeOptions) => Promise<void>;
 type RunRpcMode = (
 	session: AgentSession,
@@ -376,6 +378,7 @@ type AcpSessionFactory = (cwd: string, options?: { interactivePrompts?: boolean 
 
 export interface AcpSessionFactoryOptions {
 	baseOptions: CreateAgentSessionOptions;
+	asyncJobManager: AsyncJobManager;
 	settings: Settings;
 	sessionDir?: string;
 	authStorage: AuthStorage;
@@ -445,6 +448,7 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 			settings: nextSettings,
 			authStorage: args.authStorage,
 			modelRegistry: args.modelRegistry,
+			asyncJobManager: args.asyncJobManager,
 			agentId,
 			// ACP defers the `ask` capability and reserve-policy confirmation until
 			// client capabilities are known, without enabling other UI-only behavior.
@@ -1867,12 +1871,14 @@ export async function runRootCommand(
 		};
 
 		if (mode === "acp") {
+			const asyncJobManager = createSessionAsyncJobManager(settingsInstance.get("async.maxJobs"));
 			const createAcpSession = createAcpSessionFactory({
 				baseOptions: sessionOptions,
 				settings: settingsInstance,
 				sessionDir: parsedArgs.sessionDir,
 				authStorage,
 				modelRegistry,
+				asyncJobManager,
 				parsedArgs,
 				rawArgs,
 				createSession,
@@ -1880,7 +1886,7 @@ export async function runRootCommand(
 			// Branch-only protocol runner: keep ACP server code out of normal interactive startup.
 			const runAcpMode = deps.runAcpMode ?? (await import("./modes/acp/acp-mode")).runAcpMode;
 			stopStartupWatchdog();
-			await runAcpMode(createAcpSession);
+			await runAcpMode(createAcpSession, { asyncJobManager });
 		} else {
 			// Resolve extension-registered CLI flags before creating the session so a
 			// bad `@file` fails fast WITHOUT leaving a junk session/breadcrumb

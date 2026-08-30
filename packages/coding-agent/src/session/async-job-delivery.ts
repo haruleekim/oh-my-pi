@@ -2,11 +2,11 @@
  * Owner-routed async job delivery: formatting and batch-message assembly for
  * `async-result` follow-ups.
  *
- * Each {@link AgentSession} registers a delivery sink for its own agent id
- * (`AsyncJobManager.registerDeliverySink`) and enqueues formatted entries on
- * its yield queue; the queue's idle flush injects them as a follow-up turn.
- * This replaces the old single hardwired `onJobComplete` closure that routed
- * every completion — regardless of owner — into the first top-level session.
+ * Each {@link AgentSession} registers a delivery sink for its own agent id.
+ * Active runs enqueue formatted entries on the yield queue; hosts that defer
+ * agent-initiated turns persist idle completions as context for the next
+ * client-owned turn. Owner routing prevents one session's completion from
+ * entering another session.
  */
 import { prompt } from "@oh-my-pi/pi-utils";
 import type { AsyncJob, AsyncJobType } from "../async";
@@ -48,6 +48,7 @@ type AsyncResultJobDetails = {
 	durationMs?: number;
 	/** Full structured payload (source/mode/status/data/error), when the job used an output schema. */
 	schema?: StructuredSubagentOutput;
+	details?: Record<string, unknown>;
 };
 
 export type AsyncResultDetails = {
@@ -90,6 +91,7 @@ export function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): Custo
 			type: entry.job?.type,
 			label: entry.job?.label,
 			durationMs: entry.durationMs,
+			details: entry.job?.latestDetails,
 			structured,
 			structuredJson,
 			hasStructuredData,
@@ -105,6 +107,7 @@ export function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): Custo
 			label: job.label,
 			durationMs: job.durationMs,
 			...(job.structured ? { schema: job.structured } : {}),
+			details: job.details,
 		})),
 	};
 	const text = prompt.render(asyncResultTemplate, {

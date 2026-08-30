@@ -18,6 +18,7 @@ import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { TASK_SUBAGENT_LIFECYCLE_CHANNEL } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { mockSubagentSessionSurface } from "../helpers/subagent-session-surface";
 
 /**
  * Contracts under test — the soft request budget must degrade gracefully
@@ -72,7 +73,7 @@ function createMockSession(
 		agent: { state: { systemPrompt: ["test"] } } as never,
 		model: { api: "anthropic-messages" } as never,
 		extensionRunner: undefined as never,
-		sessionManager: { appendSessionInit: () => {} } as never,
+		...mockSubagentSessionSurface(),
 		getActiveToolNames: () => ["read", "yield"],
 		getEnabledToolNames: () => ["read", "yield"],
 		setActiveToolsByName: async () => {},

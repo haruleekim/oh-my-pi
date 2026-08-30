@@ -10,7 +10,7 @@ import type { AgentEvent, AgentIdentity, AgentMessage, AgentTelemetryConfig } fr
 import { EventLoopKeepalive, recordHandoff, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
 import type { Api, Model, ServiceTierByFamily, Usage } from "@oh-my-pi/pi-ai";
 import { logger, popLoopPhase, prompt, pushLoopPhase, untilAborted } from "@oh-my-pi/pi-utils";
-import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, AsyncJobManager } from "../async";
+import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, type AsyncJobManager } from "../async";
 import type { Rule } from "../capability/rule";
 import type { EffectiveExtensionRoots } from "../capability/types";
 import { ModelRegistry } from "../config/model-registry";
@@ -513,6 +513,8 @@ export interface ExecutorOptions {
 	authStorage?: AuthStorage;
 	modelRegistry?: ModelRegistry;
 	settings?: Settings;
+	/** Async manager shared by the parent session tree. */
+	asyncJobManager?: AsyncJobManager;
 	/**
 	 * Parent session's live per-family service tiers, the source of truth for a
 	 * subagent whose `tier.subagent` is `"inherit"`. `null` = the parent
@@ -3405,6 +3407,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						: [...defaultPrompt.slice(0, -1), subagentPrompt, defaultPrompt[defaultPrompt.length - 1]];
 				},
 				sessionManager: sessionManagerForRun,
+				asyncJobManager: options.asyncJobManager,
 				hasUI: false,
 				prewalk,
 				spawns: spawnsEnv,
@@ -3752,7 +3755,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				}
 				unsubscribe = null;
 			}
-			const jobManager = AsyncJobManager.instance();
+			const jobManager = options.asyncJobManager;
 			if (jobManager) {
 				const reap = await jobManager.cancelAndReapOwnerJobs(id, cleanupDeadlineAt);
 				if (!reap.settled) {

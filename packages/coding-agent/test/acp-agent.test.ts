@@ -3,8 +3,9 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { AgentBusyError } from "@oh-my-pi/pi-agent-core";
-import type { Model, ToolResultMessage } from "@oh-my-pi/pi-ai";
+import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { resolveLocalUrlToPath } from "@oh-my-pi/pi-coding-agent/internal-urls";
@@ -139,6 +140,8 @@ class FakeAgentSession {
 	queuedMessageCount = 0;
 	systemPrompt = "system";
 	disposed = false;
+	abortCalls = 0;
+	readonly asyncJobManager: AsyncJobManager | undefined;
 	fastMode = false;
 	forcedToolChoice: string | undefined;
 	get settings(): Settings {
@@ -168,11 +171,12 @@ class FakeAgentSession {
 	constructor(
 		cwd: string,
 		private readonly models: Model[] = TEST_MODELS,
-		options: { sessionDir?: string; agentId?: string } = {},
+		options: { sessionDir?: string; agentId?: string; asyncJobManager?: AsyncJobManager } = {},
 	) {
 		this.sessionManager = SessionManager.create(cwd, options.sessionDir);
 		this.sessionId = this.sessionManager.getSessionId();
 		this.agentId = options.agentId ?? `acp:${this.sessionId}`;
+		this.asyncJobManager = options.asyncJobManager;
 		this.agent = {
 			sessionId: this.sessionId,
 			waitForIdle: async () => {
@@ -281,6 +285,7 @@ class FakeAgentSession {
 	}
 
 	async abort(): Promise<void> {
+		this.abortCalls++;
 		this.isStreaming = false;
 	}
 
@@ -326,6 +331,7 @@ class FakeAgentSession {
 
 	async dispose(): Promise<void> {
 		this.disposed = true;
+		this.asyncJobManager?.cancelAll({ ownerId: this.agentId });
 		await this.sessionManager.close();
 	}
 
@@ -521,6 +527,7 @@ async function createHarness(
 		clientCapabilities?: ClientCapabilities;
 		/** Runs before a notification is recorded, so a test can delay one delivery. */
 		sessionUpdateHook?: (notification: SessionNotification) => Promise<void> | void;
+		asyncJobManager?: AsyncJobManager;
 	} = {},
 ): Promise<AgentHarness> {
 	const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-acp-test-"));
@@ -559,10 +566,10 @@ async function createHarness(
 		},
 	} as unknown as AgentSideConnection;
 
-	const initialSession = new FakeAgentSession(cwdA);
+	const initialSession = new FakeAgentSession(cwdA, TEST_MODELS, { asyncJobManager: options.asyncJobManager });
 	sessions.push(initialSession);
 	const factory = async (cwd: string, factoryOptions?: { interactivePrompts?: boolean }) => {
-		const session = new FakeAgentSession(cwd);
+		const session = new FakeAgentSession(cwd, TEST_MODELS, { asyncJobManager: options.asyncJobManager });
 		const setToolUIContext = vi.fn();
 		const subagentEventBus = new EventBus();
 		sessions.push(session);
@@ -572,7 +579,7 @@ async function createHarness(
 		return { session: session as unknown as AgentSession, setToolUIContext, subagentEventBus };
 	};
 
-	const agent = new AcpAgent(connection, factory, initialSession as unknown as AgentSession);
+	const agent = new AcpAgent(connection, factory, initialSession as unknown as AgentSession, options.asyncJobManager);
 	const clientCapabilities =
 		options.clientCapabilities ?? (options.elicitationHandler ? { elicitation: { form: {} } } : undefined);
 	if (clientCapabilities) {
@@ -665,6 +672,58 @@ describe("ACP agent", () => {
 
 		harness.abortController.abort();
 		await Bun.sleep(0);
+	});
+
+	it("cancels only a closed root's jobs and disposes the connection manager once", async () => {
+		const manager = new AsyncJobManager({});
+		const disposeSpy = spyOn(manager, "dispose");
+		const harness = await createHarness({ asyncJobManager: manager });
+		const first = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const second = await harness.agent.newSession({ cwd: harness.cwdB, mcpServers: [] });
+		const firstSession = harness.findSession(first.sessionId)!;
+		const secondSession = harness.findSession(second.sessionId)!;
+		const firstJobId = manager.register(
+			"task",
+			"first-root",
+			async ({ signal }) => {
+				if (!signal.aborted) {
+					const stopped = Promise.withResolvers<void>();
+					signal.addEventListener("abort", () => stopped.resolve(), { once: true });
+					await stopped.promise;
+				}
+				return "stopped";
+			},
+			{ ownerId: firstSession.agentId },
+		);
+		const secondJobId = manager.register(
+			"task",
+			"second-root",
+			async ({ signal }) => {
+				if (!signal.aborted) {
+					const stopped = Promise.withResolvers<void>();
+					signal.addEventListener("abort", () => stopped.resolve(), { once: true });
+					await stopped.promise;
+				}
+				return "stopped";
+			},
+			{ ownerId: secondSession.agentId },
+		);
+		const firstJob = manager.getJob(firstJobId)!;
+		const secondJob = manager.getJob(secondJobId)!;
+
+		await harness.agent.closeSession({ sessionId: first.sessionId });
+		await firstJob.promise;
+
+		expect(firstJob.status).toBe("cancelled");
+		expect(secondJob.status).toBe("running");
+		expect(disposeSpy).toHaveBeenCalledTimes(0);
+
+		await harness.agent.dispose();
+		await secondJob.promise;
+		await harness.agent.dispose();
+
+		expect(secondJob.status).toBe("cancelled");
+		expect(disposeSpy).toHaveBeenCalledTimes(1);
 	});
 
 	it("advertises plan mode and emits schema-valid mode updates", async () => {
@@ -1943,20 +2002,26 @@ describe("ACP agent", () => {
 	});
 
 	it("auto-cancels an in-progress turn and queues a new prompt when called mid-flight", async () => {
-		const harness = await createHarness();
+		const harness = await createHarness({ clientCapabilities: SUBAGENT_CLIENT_CAPABILITIES });
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
 		const session = harness.findSession(created.sessionId)!;
+		const child = await createPersistedSubagent(session, harness.cwdA, "LiveChild");
+		let childCancelCalls = 0;
+		const readiness = startReadyChild(session, child, "LiveChild", session.agentId, () => {
+			childCancelCalls++;
+		});
+		await drainSubagentMicrotasks();
+		await harness.agent.loadSession({ sessionId: child.sessionId, cwd: harness.cwdA, mcpServers: [] });
+		await readiness;
 
 		// Block abort() until released so we can assert the second prompt waits
-		let releaseAbort!: () => void;
 		const abortStarted = Promise.withResolvers<void>();
-		const abortRelease = new Promise<void>(resolve => {
-			releaseAbort = resolve;
-		});
+		const abortRelease = Promise.withResolvers<void>();
 		session.abort = async () => {
+			session.abortCalls++;
 			session.isStreaming = false;
 			abortStarted.resolve();
-			await abortRelease;
+			await abortRelease.promise;
 		};
 
 		const blockers: Array<() => void> = [];
@@ -2002,17 +2067,24 @@ describe("ACP agent", () => {
 		expect(session.promptCalls).toEqual(["long running"]);
 
 		// Release abort — second session.prompt should now start
-		releaseAbort();
+		abortRelease.resolve();
 		await Bun.sleep(0);
 		expect(session.promptCalls).toEqual(["long running", "overlap"]);
+		expect(session.abortCalls).toBe(1);
+		expect(childCancelCalls).toBe(0);
+		const liveChildCard = subagentCards(harness.updates)
+			.filter(update => subagentInfo(update)?.session_id === child.sessionId)
+			.at(-1);
+		expect(subagentToolCallStatus(liveChildCard!)).toBe("in_progress");
 
 		// Unblock both session.prompt calls (first is fire-and-forget, second drives the response)
 		for (const resolve of blockers) resolve();
 		const secondResponse = await secondPrompt;
 		expect(secondResponse.stopReason).toBe("end_turn");
 
-		harness.abortController.abort();
-		await Bun.sleep(0);
+		await harness.agent.closeSession({ sessionId: child.sessionId });
+		await harness.agent.closeSession({ sessionId: created.sessionId });
+		await child.dispose();
 	});
 
 	it("closes the ACP session when implicit cancel cleanup times out", async () => {
@@ -3392,6 +3464,7 @@ interface PersistedTaskResult {
 	description?: string;
 	aborted?: boolean;
 	abortReason?: string;
+	error?: string;
 	isIsolated?: boolean;
 }
 
@@ -3454,21 +3527,27 @@ async function createPersistedSubagent(
 	return child;
 }
 
-function appendTaskResults(session: FakeAgentSession, toolCallId: string, results: PersistedTaskResult[]): void {
-	const message: ToolResultMessage<PersistedTaskDetails> = {
-		role: "toolResult",
-		toolCallId,
-		toolName: "task",
-		content: [{ type: "text", text: "done" }],
-		details: {
-			projectAgentsDir: null,
-			results,
-			totalDurationMs: 1,
+function appendAsyncTaskResults(session: FakeAgentSession, jobId: string, results: PersistedTaskResult[]): void {
+	session.sessionManager.appendCustomMessageEntry(
+		"async-result",
+		"done",
+		true,
+		{
+			jobs: [
+				{
+					jobId,
+					type: "task",
+					label: results[0]?.id ?? jobId,
+					details: {
+						projectAgentsDir: null,
+						results,
+						totalDurationMs: 1,
+					} satisfies PersistedTaskDetails,
+				},
+			],
 		},
-		isError: false,
-		timestamp: Date.now(),
-	};
-	session.sessionManager.appendMessage(message);
+		"agent",
+	);
 }
 
 function readyContext(
@@ -3592,6 +3671,7 @@ describe("ACP structured subagent sessions", () => {
 	it("orders exactly-once live child updates behind a delayed late replay", async () => {
 		const replayEntered = Promise.withResolvers<void>();
 		const replayReleased = Promise.withResolvers<void>();
+		// oxlint-disable-next-line prefer-const -- assigned after the notification hook captures the binding
 		let lateChildId: string | undefined;
 		let blockedReplay = false;
 		const harness = await createHarness({
@@ -3736,6 +3816,52 @@ describe("ACP structured subagent sessions", () => {
 		await child.dispose();
 	});
 
+	it("keeps a live child running across root prompts and scopes explicit cancellation", async () => {
+		const harness = await createHarness({ clientCapabilities: SUBAGENT_CLIENT_CAPABILITIES });
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const root = harness.findSession(created.sessionId)!;
+		const child = await createPersistedSubagent(root, harness.cwdA, "BackgroundChild");
+		let childCancelCalls = 0;
+		const readiness = startReadyChild(root, child, "BackgroundChild", root.agentId, () => {
+			childCancelCalls++;
+		});
+		await drainSubagentMicrotasks();
+		await harness.agent.loadSession({ sessionId: child.sessionId, cwd: harness.cwdA, mcpServers: [] });
+		await readiness;
+
+		const firstResponse = await harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "first root prompt" }],
+		});
+		const secondResponse = await harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "second root prompt" }],
+		});
+
+		expect(firstResponse.stopReason).toBe("end_turn");
+		expect(secondResponse.stopReason).toBe("end_turn");
+		expect(root.promptCalls).toEqual(["first root prompt", "second root prompt"]);
+		expect(
+			subagentToolCallStatus(
+				subagentCards(harness.updates)
+					.filter(update => subagentInfo(update)?.session_id === child.sessionId)
+					.at(-1)!,
+			),
+		).toBe("in_progress");
+
+		await harness.agent.cancel({ sessionId: created.sessionId });
+		expect(root.abortCalls).toBe(0);
+		expect(childCancelCalls).toBe(0);
+
+		await harness.agent.cancel({ sessionId: child.sessionId });
+		expect(root.abortCalls).toBe(0);
+		expect(childCancelCalls).toBe(1);
+
+		await harness.agent.closeSession({ sessionId: child.sessionId });
+		await harness.agent.closeSession({ sessionId: created.sessionId });
+		await child.dispose();
+	});
+
 	it("evicts open child records when their root closes without disposing borrowed sessions", async () => {
 		const harness = await createHarness({ clientCapabilities: SUBAGENT_CLIENT_CAPABILITIES });
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
@@ -3779,22 +3905,25 @@ describe("ACP structured subagent sessions", () => {
 			throw new Error("child fixture was not persisted");
 		}
 
-		appendTaskResults(child, "nested-task", [
+		appendAsyncTaskResults(child, "nested-task", [
 			{
 				id: "ReplayNested",
 				agent: "task",
 				sessionId: nested.sessionId,
 				sessionFile: nestedFile,
-				exitCode: 0,
+				exitCode: 1,
+				error: "nested child failed",
 			},
 		]);
-		appendTaskResults(root, "root-task", [
+		appendAsyncTaskResults(root, "root-task", [
 			{
 				id: "ReplayChild",
 				agent: "task",
 				sessionId: child.sessionId,
 				sessionFile: childFile,
-				exitCode: 0,
+				exitCode: 1,
+				aborted: true,
+				abortReason: "replayed child stopped",
 			},
 			{
 				id: "Outside",
@@ -3842,6 +3971,8 @@ describe("ACP structured subagent sessions", () => {
 			update => subagentInfo(update)?.session_id === child.sessionId,
 		);
 		expect(subagentToolCallId(replayChildCard)).toBe(`omp-subagent:${child.sessionId}`);
+		expect(subagentToolCallStatus(replayChildCard!)).toBe("failed");
+		expect(subagentToolRawOutput(replayChildCard)).toBe("replayed child stopped");
 		expect(
 			subagentCards(harness.updates).some(update => subagentInfo(update)?.session_id === outside.sessionId),
 		).toBe(false);
@@ -3854,9 +3985,11 @@ describe("ACP structured subagent sessions", () => {
 
 		harness.updates.length = 0;
 		await harness.agent.loadSession({ sessionId: child.sessionId, cwd: harness.cwdA, mcpServers: [] });
-		expect(subagentCards(harness.updates).some(update => subagentInfo(update)?.session_id === nested.sessionId)).toBe(
-			true,
+		const replayNestedCard = subagentCards(harness.updates).find(
+			update => subagentInfo(update)?.session_id === nested.sessionId,
 		);
+		expect(subagentToolCallStatus(replayNestedCard!)).toBe("failed");
+		expect(subagentToolRawOutput(replayNestedCard)).toBe("nested child failed");
 		await harness.agent.loadSession({ sessionId: nested.sessionId, cwd: harness.cwdA, mcpServers: [] });
 		await expect(
 			harness.agent.loadSession({ sessionId: outside.sessionId, cwd: harness.cwdA, mcpServers: [] }),

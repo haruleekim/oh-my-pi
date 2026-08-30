@@ -48,7 +48,7 @@ import {
 	formatAdvisorContextPrompt,
 	formatAdvisorMemoryPrompt,
 } from "./advisor";
-import { AsyncJobManager } from "./async";
+import { AsyncJobManager, createSessionAsyncJobManager } from "./async";
 import { AutoLearnController, buildAutoLearnInstructions } from "./autolearn/controller";
 import { createAutoresearchExtension } from "./autoresearch";
 import { loadCapability } from "./capability";
@@ -607,6 +607,12 @@ export interface CreateAgentSessionOptions {
 
 	/** Session manager. Default: session stored under the configured agentDir sessions root */
 	sessionManager?: SessionManager;
+	/**
+	 * Explicit session-scoped async manager supplied by an embedding host.
+	 * The caller retains ownership and must dispose it after every session that shares it.
+	 * @internal
+	 */
+	asyncJobManager?: AsyncJobManager;
 
 	/** Override local:// protocol options for subagent local:// sharing. Default: uses the session's own artifacts dir and session ID. */
 	localProtocolOptions?: LocalProtocolOptions;
@@ -1722,24 +1728,17 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	const restrictToolNames = options.restrictToolNames === true;
 	const enableLsp = options.enableLsp ?? !restrictToolNames;
 	const lspReadOnly = options.lspReadOnly ?? restrictToolNames;
-	const asyncMaxJobs = Math.min(100, Math.max(1, settings.get("async.maxJobs") ?? 100));
-	// Only the first top-level session in a process owns an AsyncJobManager.
-	// Subagents inherit the parent's manager via `AsyncJobManager.instance()`
-	// (set below), and any additional top-level session spun up in-process
-	// (e.g. the agent-creation architect in `agents-hub.ts`) must share
-	// the live singleton — otherwise its dispose path would clobber the
-	// owning session's manager and break the `task`/`bash` async paths
-	// (issue #1923). The `instance()` guard means later sessions also skip
-	// constructing an orphaned manager that nothing would ever route to.
-	// Delivery is owner-routed: every AgentSession registers its own sink
-	// (see session/async-job-delivery.ts), so the manager takes no default
-	// onJobComplete here.
-	const asyncJobManager =
-		!options.parentTaskPrefix && !AsyncJobManager.instance()
-			? new AsyncJobManager({ maxRunningJobs: asyncMaxJobs })
+	// Only the first top-level session in a process owns the singleton manager.
+	// An explicitly supplied manager remains caller-owned and is scoped to this
+	// session tree without changing the process-global instance.
+	const ownedAsyncJobManager =
+		!options.asyncJobManager && !options.parentTaskPrefix && !AsyncJobManager.instance()
+			? createSessionAsyncJobManager(settings.get("async.maxJobs"))
 			: undefined;
-
-	const scopedAsyncJobManager = asyncJobManager ?? (options.parentTaskPrefix ? AsyncJobManager.instance() : undefined);
+	const scopedAsyncJobManager =
+		options.asyncJobManager ??
+		ownedAsyncJobManager ??
+		(options.parentTaskPrefix ? AsyncJobManager.instance() : undefined);
 
 	const agentRegistry = options.agentRegistry ?? AgentRegistry.global();
 	const resolvedAgentId = options.agentId ?? options.parentTaskPrefix ?? MAIN_AGENT_ID;
@@ -1915,12 +1914,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			authStorage,
 			modelRegistry,
 			getTelemetry: () => agent?.telemetry,
-			// Subagents inherit the singleton (the parent's manager) so their bash/task
-			// completions still flow into the spawning conversation's yieldQueue.
-			// Secondary in-process top-level sessions (no parentTaskPrefix, no
-			// constructed manager because the singleton was already installed) leave
-			// this undefined so tools and session job snapshots refuse async work
-			// instead of silently routing into the owning session (issue #1923).
+			// Explicitly scoped session trees share their caller-owned manager.
+			// Otherwise subagents inherit the parent singleton. A secondary
+			// in-process top-level session without either source stays synchronous
+			// rather than routing work into another session's manager (issue #1923).
 			asyncJobManager: scopedAsyncJobManager,
 		};
 		let browserPrelude: EvalPreludeDefinition | undefined;
@@ -1954,7 +1951,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// so without this a TTSR-only rule (e.g. a triggered builtin) is not
 			// addressable and `rule://` reports "Available: none".
 			setActiveRules([...rulebookRules, ...alwaysApplyRules, ...ttsrManager.getRules()]);
-			if (asyncJobManager) AsyncJobManager.setInstance(asyncJobManager);
+			if (ownedAsyncJobManager) AsyncJobManager.setInstance(ownedAsyncJobManager);
 		}
 		const localProtocolOptions = options.localProtocolOptions ?? {
 			getArtifactsDir,
@@ -3739,11 +3736,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			autoApprove: options.autoApprove,
 			scoutAllowedBySpawnPolicy: isScoutSpawnable(undefined, options.spawns ?? "*"),
 			evalKernelOwnerId,
-			// Defined only for top-level sessions (creation is gated above).
-			// AgentSession uses this to decide whether it may dispose the global
-			// AsyncJobManager on teardown; subagents inherit the parent's and
-			// **MUST NOT** tear it down.
-			ownedAsyncJobManager: asyncJobManager,
+			// Only the session that creates the process singleton owns it.
+			// Explicitly injected and inherited managers remain caller-owned.
+			ownedAsyncJobManager,
 			asyncJobManager: scopedAsyncJobManager,
 			scopedModels: options.scopedModels,
 			promptTemplates,
@@ -4326,11 +4321,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				if (hasRegistered) unregisterUnlessParked();
 			} else {
 				if (hasRegistered) unregisterUnlessParked();
-				if (asyncJobManager) {
-					if (AsyncJobManager.instance() === asyncJobManager) {
+				if (ownedAsyncJobManager) {
+					if (AsyncJobManager.instance() === ownedAsyncJobManager) {
 						AsyncJobManager.setInstance(undefined);
 					}
-					await asyncJobManager.dispose({ timeoutMs: 3_000 });
+					await ownedAsyncJobManager.dispose({ timeoutMs: 3_000 });
 				}
 				await releaseComputerSessionsForOwner(evalKernelOwnerId);
 				await disposeKernelSessionsByOwner(evalKernelOwnerId);

@@ -2180,10 +2180,11 @@ export class AgentSession {
 	}
 
 	/**
-	 * Delivery sink for async jobs owned by this agent: format the result
-	 * (spilling oversized output to an artifact), enqueue it as an async-result
-	 * follow-up, and settle only after the yield queue injects or discards it.
-	 * This keeps the job body recoverable through `hub` while injection is pending.
+	 * Delivery sink for async jobs owned by this agent: format the result,
+	 * spilling oversized output to an artifact, then either persist an idle
+	 * deferred-host completion for the next client turn or enqueue it for the
+	 * active yield path. The job body remains recoverable through `hub` until
+	 * the selected delivery sink accepts it.
 	 */
 	async #deliverAsyncJobResult(manager: AsyncJobManager, jobId: string, text: string, job?: AsyncJob): Promise<void> {
 		if (this.#isDisposed) return;
@@ -2198,13 +2199,25 @@ export class AgentSession {
 		if (epoch !== this.#asyncDeliveryEpoch) return;
 		if (manager.isDeliverySuppressed(jobId)) return;
 		const durationMs = job ? Math.max(0, Date.now() - job.startTime) : undefined;
-		await this.yieldQueue.enqueueWithReceipt<AsyncResultEntry>("async-result", {
+		const entry: AsyncResultEntry = {
 			jobId,
 			result: formatted,
 			job,
 			durationMs,
 			epoch,
-		});
+		};
+		if (
+			!this.isStreaming &&
+			this.#clientBridge?.deferAgentInitiatedTurns === true &&
+			!this.#allowAcpAgentInitiatedTurns
+		) {
+			const message = buildAsyncResultBatchMessage([entry]);
+			if (message) {
+				await this.sendCustomMessage(message, { deliverAs: "nextTurn", triggerTurn: false });
+			}
+			return;
+		}
+		await this.yieldQueue.enqueueWithReceipt<AsyncResultEntry>("async-result", entry);
 	}
 
 	async #formatAsyncResultForFollowUp(result: string): Promise<string> {

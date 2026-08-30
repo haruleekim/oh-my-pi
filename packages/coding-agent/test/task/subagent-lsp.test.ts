@@ -17,6 +17,7 @@ import type { IsolationHandle, WorktreeBaseline } from "@oh-my-pi/pi-coding-agen
 import * as worktreeModule from "@oh-my-pi/pi-coding-agent/task/worktree";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
+import { mockSubagentSessionSurface } from "../helpers/subagent-session-surface";
 import "@oh-my-pi/pi-coding-agent/tools/yield";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 
@@ -55,9 +56,7 @@ function createYieldingSession(): AgentSession {
 		agent: { state: { systemPrompt: ["test"] } },
 		model: undefined,
 		extensionRunner: undefined,
-		sessionManager: {
-			appendSessionInit: () => {},
-		},
+		...mockSubagentSessionSurface(),
 		getActiveToolNames: () => ["yield"],
 		getEnabledToolNames: () => ["yield"],
 		setActiveToolsByName: async () => {},

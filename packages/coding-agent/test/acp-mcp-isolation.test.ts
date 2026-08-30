@@ -13,6 +13,7 @@
  */
 
 import { afterAll, describe, expect, it } from "bun:test";
+import { createSessionAsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createAcpSessionFactory } from "@oh-my-pi/pi-coding-agent/main";
@@ -23,8 +24,10 @@ import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
 const authStorage = createInMemoryAuthStorage();
 const modelRegistry = new ModelRegistry(authStorage);
+const asyncJobManager = createSessionAsyncJobManager(100);
 
-afterAll(() => {
+afterAll(async () => {
+	await asyncJobManager.dispose({ timeoutMs: 1_000 });
 	authStorage.close();
 });
 
@@ -56,6 +59,7 @@ describe("createAcpSessionFactory MCP isolation (issue #1234)", () => {
 			// baseOptions deliberately sets enableMCP=true to prove the factory ignores it.
 			const factory = createAcpSessionFactory({
 				baseOptions: { enableMCP: true } as CreateAgentSessionOptions,
+				asyncJobManager,
 				settings,
 				sessionDir: tempDir.join("sessions"),
 				authStorage,
@@ -69,6 +73,7 @@ describe("createAcpSessionFactory MCP isolation (issue #1234)", () => {
 			expect(result.session).toBe(fakeSession);
 			expect(captured).toHaveLength(1);
 			expect(captured[0].enableMCP).toBe(false);
+			expect(captured[0].asyncJobManager).toBe(asyncJobManager);
 		} finally {
 			await tempDir.remove();
 		}
@@ -88,6 +93,7 @@ describe("createAcpSessionFactory MCP isolation (issue #1234)", () => {
 			} as unknown as AgentSession;
 			const factory = createAcpSessionFactory({
 				baseOptions: {} as CreateAgentSessionOptions,
+				asyncJobManager,
 				settings,
 				sessionDir: tempDir.join("sessions"),
 				authStorage,
@@ -127,6 +133,7 @@ describe("createAcpSessionFactory MCP isolation (issue #1234)", () => {
 					additionalExtensionPaths: [trustedPath],
 				} as CreateAgentSessionOptions,
 				settings,
+				asyncJobManager,
 				sessionDir: tempDir.join("sessions"),
 				authStorage,
 				modelRegistry,
@@ -168,6 +175,7 @@ describe("createAcpSessionFactory MCP isolation (issue #1234)", () => {
 					additionalExtensionPaths: [trustedPath],
 				} as CreateAgentSessionOptions,
 				settings,
+				asyncJobManager,
 				sessionDir: tempDir.join("sessions"),
 				authStorage,
 				modelRegistry,
@@ -223,6 +231,7 @@ describe("createAcpSessionFactory TITLE_SYSTEM.md per-cwd resolution (PR #3736)"
 					titleSystemPrompt: "Launch-cwd policy that must not leak.",
 				} as CreateAgentSessionOptions,
 				settings,
+				asyncJobManager,
 				sessionDir: tempDir.join("sessions"),
 				authStorage,
 				modelRegistry,

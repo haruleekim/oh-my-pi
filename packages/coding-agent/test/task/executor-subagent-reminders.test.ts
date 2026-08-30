@@ -15,6 +15,7 @@ import {
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { logger } from "@oh-my-pi/pi-utils";
+import { mockSubagentSessionSurface } from "../helpers/subagent-session-surface";
 
 function createAssistantStopMessage(text: string): AssistantMessage {
 	return {
@@ -58,9 +59,7 @@ function createMockSession(
 		agent: { state: { systemPrompt: ["test"] } },
 		model: undefined,
 		extensionRunner: undefined,
-		sessionManager: {
-			appendSessionInit: () => {},
-		},
+		...mockSubagentSessionSurface(),
 		getActiveToolNames: () => ["read", "yield"],
 		getEnabledToolNames: () => ["read", "yield"],
 		setActiveToolsByName: async (_toolNames: string[]) => {},

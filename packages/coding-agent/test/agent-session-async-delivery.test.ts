@@ -253,6 +253,74 @@ describe("AgentSession owner-routed async delivery", () => {
 		expect(message?.content).toContain("subagent yielded no data");
 	});
 
+	it("persists an idle ACP completion for the next client prompt without starting a turn", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			convertToLlm,
+			streamFn: mock.stream,
+		});
+		const authStorage = await AuthStorage.create(":memory:");
+		authStorages.push(authStorage);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const manager = new AsyncJobManager({});
+		AsyncJobManager.setInstance(manager);
+		const sessionManager = SessionManager.inMemory();
+
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry: new ModelRegistry(authStorage),
+			agentId: "Main",
+			asyncJobManager: manager,
+		});
+		session.setClientBridge({
+			capabilities: {},
+			deferAgentInitiatedTurns: true,
+		});
+
+		manager.register(
+			"task",
+			"BackgroundChild",
+			async ({ reportProgress }) => {
+				await reportProgress("Background child complete", {
+					results: [{ id: "BackgroundChild", sessionId: "child-session", isIsolated: false }],
+				});
+				return "IDLE ACP RESULT";
+			},
+			{ id: "background-child", ownerId: "Main" },
+		);
+		await manager.waitForOwnerJobs("Main");
+		await manager.drainDeliveries({ filter: { ownerId: "Main" } });
+
+		expect(mock.calls).toHaveLength(0);
+		const persisted = sessionManager
+			.getEntries()
+			.find(entry => entry.type === "custom_message" && entry.customType === "async-result");
+		expect(persisted).toMatchObject({
+			type: "custom_message",
+			customType: "async-result",
+			details: {
+				jobs: [
+					{
+						jobId: "background-child",
+						details: {
+							results: [{ id: "BackgroundChild", sessionId: "child-session", isIsolated: false }],
+						},
+					},
+				],
+			},
+		});
+
+		await session.prompt("second client prompt");
+
+		expect(mock.calls).toHaveLength(1);
+		expect(JSON.stringify(mock.calls[0]!.context.messages)).toContain("IDLE ACP RESULT");
+	});
+
 	it("routes an advisor-owned launch completion through the session", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });

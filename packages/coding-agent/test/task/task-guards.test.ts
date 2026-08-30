@@ -9,6 +9,7 @@ import { formatResultOutputFallback } from "@oh-my-pi/pi-coding-agent/task";
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import { mockSubagentSessionSurface } from "../helpers/subagent-session-surface";
 
 /**
  * Contract: runaway-subagent guards.
@@ -79,7 +80,7 @@ function createFakeSession(config: FakeSessionConfig = {}): FakeSessionHandle {
 		state: { messages: [] } as never,
 		agent: { state: { systemPrompt: ["test"] } } as never,
 		extensionRunner: undefined as never,
-		sessionManager: { appendSessionInit: () => {} } as never,
+		...mockSubagentSessionSurface(),
 		getActiveToolNames: () => ["read", "yield"],
 		getEnabledToolNames: () => ["read", "yield"],
 		setActiveToolsByName: async (_names: string[]) => {},

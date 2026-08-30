@@ -281,7 +281,11 @@ describe("task spawn routing", () => {
 		const gate = deferred();
 		const runSpy = vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
 			await gate.promise;
-			return makeResult(options.id ?? "?");
+			return makeResult(options.id ?? "?", {
+				sessionId: "child-session",
+				sessionFile: "/tmp/child-session.jsonl",
+				isIsolated: false,
+			});
 		});
 
 		const manager = createManager();
@@ -300,6 +304,7 @@ describe("task spawn routing", () => {
 		expect(text).toContain("Spawned agent `Spawnling`");
 		const jobId = result.details?.async?.jobId;
 		expect(jobId).toBeTruthy();
+		expect(result.details?.results).toEqual([]);
 		expect(text).toContain(`job \`${jobId}\``);
 		const job = manager.getJob(jobId!);
 		expect(job?.status).toBe("running");
@@ -314,6 +319,56 @@ describe("task spawn routing", () => {
 		expect(job!.resultText).toContain("history://Spawnling");
 		expect(runSpy).toHaveBeenCalledTimes(1);
 		expect(runSpy.mock.calls[0]?.[0].modelOverride).toEqual(["openai/gpt-4.1-mini"]);
+		const settledDetails = job!.latestDetails;
+		expect(settledDetails?.results).toEqual([
+			expect.objectContaining({
+				id: "Spawnling",
+				sessionId: "child-session",
+				sessionFile: "/tmp/child-session.jsonl",
+				isIsolated: false,
+			}),
+		]);
+	});
+
+	it("retains failed child metadata in the settled async details", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: [taskAgent],
+			projectAgentsDir: null,
+		});
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options =>
+			makeResult(options.id ?? "?", {
+				sessionId: "failed-session",
+				sessionFile: "/tmp/failed-session.jsonl",
+				isIsolated: false,
+				exitCode: 1,
+				error: "child failed",
+				aborted: true,
+				abortReason: "cancelled by child",
+			}),
+		);
+
+		const manager = createManager();
+		const tool = await TaskTool.create(createSession({ manager }));
+		const result = await tool.execute("tc-failed-details", {
+			agent: "task",
+			name: "FailedChild",
+			task: "Fail with metadata.",
+		} as TaskParams);
+		const job = manager.getJob(result.details!.async!.jobId)!;
+		await job.promise;
+
+		expect(job.status).toBe("failed");
+		expect(job.latestDetails?.results).toEqual([
+			expect.objectContaining({
+				id: "FailedChild",
+				sessionId: "failed-session",
+				sessionFile: "/tmp/failed-session.jsonl",
+				isIsolated: false,
+				error: "child failed",
+				aborted: true,
+				abortReason: "cancelled by child",
+			}),
+		]);
 	});
 
 	it("retains the temporary artifacts directory for a completed async spawn (in-memory session)", async () => {

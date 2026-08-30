@@ -206,17 +206,17 @@ describe("task per-item blocking split", () => {
 		}
 
 		// The async job settles BEFORE the blocking subset: the returned result
-		// must already report the converged async state, not a stale "running".
+		// must include both concrete results with a converged async state.
 		gates.get("WorkerTwo")!.resolve();
 		await manager.getJob("WorkerTwo")!.promise;
 		gates.get("ScoutTwo")!.resolve();
 		const result = await executePromise;
 
 		expect(result.details?.async?.state).toBe("completed");
-		expect(result.details?.results.map(r => r.id)).toEqual(["ScoutTwo"]);
+		expect(result.details?.results.map(r => r.id)).toEqual(["ScoutTwo", "WorkerTwo"]);
 
-		// The job's completion update carries the shared aggregate — inline
-		// results included — never an empty-results skeleton, and exactly once.
+		// The job emits one terminal update with its concrete result; the later
+		// returned aggregate adds the inline result without duplicating settlement.
 		const completionUpdates = updates.filter(u => u.text.includes("Background task WorkerTwo complete."));
 		expect(completionUpdates).toHaveLength(1);
 	});

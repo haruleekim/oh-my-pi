@@ -24,6 +24,7 @@ import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/
 import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition, AgentProgress } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import { mockSubagentSessionSurface } from "../helpers/subagent-session-surface";
 
 const TAIL_BYTES = 8 * 1024;
 
@@ -171,7 +172,7 @@ function createScriptedSession(
 		agent: { state: { systemPrompt: ["test"] } },
 		model: undefined,
 		extensionRunner: undefined,
-		sessionManager: { appendSessionInit: () => {} },
+		...mockSubagentSessionSurface(),
 		getActiveToolNames: () => ["read", "yield"],
 		getEnabledToolNames: () => ["read", "yield"],
 		setActiveToolsByName: async (_toolNames: string[]) => {},

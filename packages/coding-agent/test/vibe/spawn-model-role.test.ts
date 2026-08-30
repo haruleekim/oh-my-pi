@@ -19,11 +19,13 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import type { VibeCli } from "@oh-my-pi/pi-coding-agent/vibe/lifecycle";
 import { VibeSessionRegistry } from "@oh-my-pi/pi-coding-agent/vibe/runtime";
 
-function makeParentSession(settings: Settings): ToolSession {
+const managers: AsyncJobManager[] = [];
+
+function makeParentSession(settings: Settings, asyncJobManager: AsyncJobManager): ToolSession {
 	return {
 		cwd: "/tmp",
 		settings,
-		asyncJobManager: new AsyncJobManager({ onJobComplete: () => {} }),
+		asyncJobManager,
 		getSessionId: () => "parent-session",
 		// No session file: spawn skips lifecycle persistence and stays in-memory.
 		getSessionFile: () => null,
@@ -34,7 +36,10 @@ function makeParentSession(settings: Settings): ToolSession {
 }
 
 /** Spawn one worker and capture the ExecutorOptions the vibe path hands the executor. */
-async function spawnAndCaptureOptions(cli: VibeCli, settings: Settings): Promise<ExecutorOptions> {
+async function spawnAndCaptureOptions(
+	cli: VibeCli,
+	settings: Settings,
+): Promise<{ options: ExecutorOptions; manager: AsyncJobManager }> {
 	const captured = Promise.withResolvers<ExecutorOptions>();
 	vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
 		captured.resolve(options);
@@ -54,20 +59,23 @@ async function spawnAndCaptureOptions(cli: VibeCli, settings: Settings): Promise
 		} as SingleResult;
 	});
 
+	const manager = new AsyncJobManager({ onJobComplete: () => {} });
+	managers.push(manager);
 	const registry = VibeSessionRegistry.global();
-	await registry.spawn(makeParentSession(settings), { cli, prompt: "work" });
-	return captured.promise;
+	await registry.spawn(makeParentSession(settings, manager), { cli, prompt: "work" });
+	return { options: await captured.promise, manager };
 }
 
 describe("vibe worker spawn model role", () => {
-	afterEach(() => {
+	afterEach(async () => {
 		vi.restoreAllMocks();
 		VibeSessionRegistry.resetGlobalForTests();
 		AgentRegistry.resetGlobalForTests();
+		await Promise.all(managers.splice(0).map(manager => manager.dispose({ timeoutMs: 1_000 })));
 	});
 
 	it("forwards the `task` role behind the `good` worker's expanded patterns", async () => {
-		const options = await spawnAndCaptureOptions(
+		const { options } = await spawnAndCaptureOptions(
 			"good",
 			Settings.isolated({
 				modelRoles: { default: "anthropic/opus", task: "anthropic/sonnet" },
@@ -79,7 +87,7 @@ describe("vibe worker spawn model role", () => {
 	});
 
 	it("forwards the `smol` role behind the `fast` worker's expanded patterns", async () => {
-		const options = await spawnAndCaptureOptions(
+		const { options } = await spawnAndCaptureOptions(
 			"fast",
 			Settings.isolated({
 				modelRoles: { default: "anthropic/opus", smol: "fast/hy3" },
@@ -94,7 +102,7 @@ describe("vibe worker spawn model role", () => {
 		// `task.agentModelOverrides` wins over the agent definition, and an explicit
 		// selector carries no role — the child must then inherit `default`, not
 		// capture the routing of whichever role happens to name the same model.
-		const options = await spawnAndCaptureOptions(
+		const { options } = await spawnAndCaptureOptions(
 			"good",
 			Settings.isolated({
 				modelRoles: { default: "anthropic/opus", task: "anthropic/sonnet" },
@@ -104,5 +112,11 @@ describe("vibe worker spawn model role", () => {
 
 		expect(options.modelOverride).toEqual(["openai-codex/sol"]);
 		expect(options.modelRole).toBeUndefined();
+	});
+
+	it("forwards the parent async manager to executor cleanup", async () => {
+		const { options, manager } = await spawnAndCaptureOptions("good", Settings.isolated({}));
+
+		expect(options.asyncJobManager).toBe(manager);
 	});
 });

@@ -895,6 +895,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		let failedCount = 0;
 		let primaryJobId = asyncSpawns[0].agentId;
 		const syncResults: SingleResult[] = [];
+		const asyncResults: SingleResult[] = [];
 		// oxlint-disable-next-line prefer-const -- read by buildAsyncDetails before assignment
 		let syncUsage: Usage | undefined;
 		// oxlint-disable-next-line prefer-const -- read by buildAsyncDetails before assignment
@@ -902,7 +903,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		let syncProjectAgentsDir: string | null = null;
 		const buildAsyncDetails = (): TaskToolDetails => ({
 			projectAgentsDir: syncProjectAgentsDir,
-			results: [...syncResults],
+			results: [...syncResults, ...asyncResults],
 			totalDurationMs: Date.now() - callStartedAt,
 			usage: syncUsage,
 			outputPaths: syncOutputPaths,
@@ -927,6 +928,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					ircEnabled,
 					buildDetails: buildAsyncDetails,
 					onUpdate,
+					onResult: result => asyncResults.push(result),
 					onSettled: failed => {
 						settledCount += 1;
 						if (failed) failedCount += 1;
@@ -1087,9 +1089,20 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		buildDetails: () => TaskToolDetails;
 		onUpdate?: AgentToolUpdateCallback<TaskToolDetails>;
 		onSettled?: (failed: boolean) => void;
+		onResult?: (result: SingleResult) => void;
 	}): string {
-		const { manager, toolCallId, spawnParams, agentId, progress, ircEnabled, buildDetails, onUpdate, onSettled } =
-			options;
+		const {
+			manager,
+			toolCallId,
+			spawnParams,
+			agentId,
+			progress,
+			ircEnabled,
+			buildDetails,
+			onUpdate,
+			onSettled,
+			onResult,
+		} = options;
 		const buildFollowUpHint = async (aborted: boolean): Promise<string> => {
 			if (aborted) {
 				const ref = AgentRegistry.global().get(agentId);
@@ -1221,6 +1234,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						delete progress.resolvedModel;
 						delete progress.resolvedModelIsFallback;
 					}
+					if (singleResult) onResult?.(singleResult);
 					onSettled?.(resultFailed);
 					const statusText = resultFailed
 						? `Background task ${agentId} failed.`

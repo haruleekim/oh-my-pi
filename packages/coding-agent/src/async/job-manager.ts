@@ -211,6 +211,11 @@ export interface AsyncJobRegisterOptions {
 export interface AsyncJobFilter {
 	ownerId?: string;
 }
+/** Creates a session-scoped manager with the configured public job limit. */
+export function createSessionAsyncJobManager(maxJobs: number | undefined): AsyncJobManager {
+	const maxRunningJobs = Math.min(100, Math.max(1, maxJobs ?? 100));
+	return new AsyncJobManager({ maxRunningJobs });
+}
 
 export class AsyncJobManager {
 	static #instance: AsyncJobManager | undefined;
