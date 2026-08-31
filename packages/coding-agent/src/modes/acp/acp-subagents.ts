@@ -136,6 +136,10 @@ function metadata(sessionId: string): { subagent_session_info: SubagentSessionMe
 	};
 }
 
+export interface AcpSubagentAttachState {
+	waitForAutoLoad: boolean;
+}
+
 export class AcpSubagentBridge {
 	readonly #connection: AgentSideConnection;
 	readonly #clientCapabilities: ClientCapabilities | undefined;
@@ -145,6 +149,7 @@ export class AcpSubagentBridge {
 	readonly #cardsBySession = new Map<string, SubagentCard>();
 	readonly #liveBySession = new Map<string, LiveChild>();
 	readonly #liveByAgent = new Map<string, LiveChild>();
+	readonly #attachState: AcpSubagentAttachState;
 	readonly #attachTimeoutMs: number;
 	readonly #coldBySession = new Map<string, ColdChild>();
 	readonly #blobs = new BlobStore(getBlobsDir());
@@ -161,12 +166,14 @@ export class AcpSubagentBridge {
 		rootSessionId: string,
 		rootAgentId: string,
 		subagentEventBus: EventBus,
+		attachState: AcpSubagentAttachState,
 		attachTimeoutMs: number = ACP_SUBAGENT_ATTACH_TIMEOUT_MS,
 	) {
 		this.#connection = connection;
 		this.#clientCapabilities = clientCapabilities;
 		this.#rootSessionId = rootSessionId;
 		this.#rootAgentId = rootAgentId;
+		this.#attachState = attachState;
 		this.#attachTimeoutMs = attachTimeoutMs;
 		this.#agentRoutes.set(rootAgentId, rootSessionId);
 		this.#unsubscribeLifecycle = subagentEventBus.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, payload => {
@@ -347,7 +354,13 @@ export class AcpSubagentBridge {
 	}
 
 	async #awaitAttach(child: LiveChild): Promise<void> {
-		if (child.attached || this.#disposed) return;
+		if (child.attached || child.readinessSettled || this.#disposed) return;
+		if (!this.#attachState.waitForAutoLoad) {
+			child.readinessSettled = true;
+			this.#routeThroughLoadedAncestor(child);
+			return;
+		}
+
 		const timeout = Promise.withResolvers<false>();
 		const timeoutId = setTimeout(() => timeout.resolve(false), this.#attachTimeoutMs);
 		timeoutId.unref();
@@ -355,16 +368,25 @@ export class AcpSubagentBridge {
 		child.readinessSettled = true;
 		clearTimeout(timeoutId);
 		if (attached || child.attached || this.#disposed) return;
+
+		const shouldWarn = this.#attachState.waitForAutoLoad;
+		this.#attachState.waitForAutoLoad = false;
+		this.#routeThroughLoadedAncestor(child);
+		if (shouldWarn) {
+			logger.warn("ACP subagent attach timed out; routing through the nearest loaded ancestor", {
+				childSessionId: child.childSessionId,
+				ancestorSessionId: child.fallbackSessionId,
+			});
+		}
+	}
+
+	#routeThroughLoadedAncestor(child: LiveChild): void {
 		child.session.setClientBridge(
 			createAcpClientBridge(this.#connection, child.fallbackSessionId, this.#clientCapabilities, {
 				deferAgentInitiatedTurns: false,
 			}),
 		);
 		this.#agentRoutes.set(child.agentId, child.fallbackSessionId);
-		logger.warn("ACP subagent attach timed out; routing through the nearest loaded ancestor", {
-			childSessionId: child.childSessionId,
-			ancestorSessionId: child.fallbackSessionId,
-		});
 	}
 
 	#nearestLoadedAncestor(agentId: string): string {

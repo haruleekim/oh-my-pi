@@ -3480,8 +3480,15 @@ interface SubagentInfoMeta {
 	message_end_index?: number;
 }
 
-const SUBAGENT_CLIENT_CAPABILITIES: ClientCapabilities = {
+const SUBAGENT_METADATA_ONLY_CLIENT_CAPABILITIES: ClientCapabilities = {
 	_meta: { subagent_session_info: true },
+};
+
+const SUBAGENT_CLIENT_CAPABILITIES: ClientCapabilities = {
+	_meta: {
+		subagent_session_info: true,
+		subagent_session_auto_load: true,
+	},
 };
 
 async function drainSubagentMicrotasks(): Promise<void> {
@@ -3588,7 +3595,7 @@ describe("ACP structured subagent sessions", () => {
 		const child = await createPersistedSubagent(root, harness.cwdA, "Unmarked");
 
 		const handler = root.getSubagentSessionReadyHandler();
-		if (handler) await handler(readyContext(child, "Unmarked", root.agentId));
+		expect(handler).toBeUndefined();
 		const prompted = await child.prompt("Do the thing.");
 
 		expect(prompted).toBe(true);
@@ -3597,6 +3604,69 @@ describe("ACP structured subagent sessions", () => {
 
 		await harness.agent.closeSession({ sessionId: created.sessionId });
 		await child.dispose();
+	});
+
+	it("emits metadata-only child cards without waiting for session load", async () => {
+		const harness = await createHarness({ clientCapabilities: SUBAGENT_METADATA_ONLY_CLIENT_CAPABILITIES });
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const root = harness.findSession(created.sessionId)!;
+		const child = await createPersistedSubagent(root, harness.cwdA, "MetadataOnly");
+
+		let ready = false;
+		const readiness = startReadyChild(root, child, "MetadataOnly", root.agentId).then(() => {
+			ready = true;
+		});
+		await drainSubagentMicrotasks();
+
+		expect(ready).toBe(true);
+		await readiness;
+		expect(subagentCards(harness.updates)).toHaveLength(1);
+		await child.clientBridge?.requestPermission?.(
+			{ toolCallId: "metadata-only-permission", toolName: "bash", title: "bash" },
+			[{ optionId: "reject", name: "Reject", kind: "reject_once" }],
+		);
+		expect(harness.permissionSessionIds.at(-1)).toBe(created.sessionId);
+
+		await harness.agent.closeSession({ sessionId: created.sessionId });
+		await child.dispose();
+	});
+
+	it("disables attach waits across roots after the first auto-load timeout", async () => {
+		const harness = await createHarness({ clientCapabilities: SUBAGENT_CLIENT_CAPABILITIES });
+		harness.agent.setSubagentAttachTimeoutForTesting(10);
+		const firstRootInfo = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const firstRoot = harness.findSession(firstRootInfo.sessionId)!;
+		const firstChild = await createPersistedSubagent(firstRoot, harness.cwdA, "FirstTimeout");
+
+		let firstReady = false;
+		const firstReadiness = startReadyChild(firstRoot, firstChild, "FirstTimeout", firstRoot.agentId).then(() => {
+			firstReady = true;
+		});
+		await drainSubagentMicrotasks();
+		expect(firstReady).toBe(false);
+		await firstReadiness;
+		expect(firstReady).toBe(true);
+
+		const secondRootInfo = await harness.agent.newSession({ cwd: harness.cwdB, mcpServers: [] });
+		const secondRoot = harness.findSession(secondRootInfo.sessionId)!;
+		const secondChild = await createPersistedSubagent(secondRoot, harness.cwdB, "AfterTimeout");
+		let secondReady = false;
+		const secondReadiness = startReadyChild(secondRoot, secondChild, "AfterTimeout", secondRoot.agentId).then(() => {
+			secondReady = true;
+		});
+		await drainSubagentMicrotasks();
+
+		expect(secondReady).toBe(true);
+		await secondReadiness;
+		await secondChild.clientBridge?.requestPermission?.(
+			{ toolCallId: "second-root-permission", toolName: "bash", title: "bash" },
+			[{ optionId: "reject", name: "Reject", kind: "reject_once" }],
+		);
+		expect(harness.permissionSessionIds.at(-1)).toBe(secondRootInfo.sessionId);
+
+		await harness.agent.closeSession({ sessionId: firstRootInfo.sessionId });
+		await harness.agent.closeSession({ sessionId: secondRootInfo.sessionId });
+		await Promise.all([firstChild.dispose(), secondChild.dispose()]);
 	});
 
 	it("emits stable direct, parallel, and nested child cards", async () => {

@@ -92,7 +92,7 @@ import {
 	mapAgentSessionEventToAcpSessionUpdates,
 	normalizeReplayToolArguments,
 } from "./acp-event-mapper";
-import { ACP_SUBAGENT_ATTACH_TIMEOUT_MS, AcpSubagentBridge } from "./acp-subagents";
+import { ACP_SUBAGENT_ATTACH_TIMEOUT_MS, type AcpSubagentAttachState, AcpSubagentBridge } from "./acp-subagents";
 import { ACP_TERMINAL_AUTH_FLAG } from "./terminal-auth";
 
 const ACP_DEFAULT_MODE_ID = "default";
@@ -639,6 +639,7 @@ export class AcpAgent implements Agent {
 	#disposePromise: Promise<void> | undefined;
 	#cleanupRegistered = false;
 	#clientCapabilities: ClientCapabilities | undefined;
+	readonly #subagentAttachState: AcpSubagentAttachState = { waitForAutoLoad: false };
 	#subagentAttachTimeoutMs = ACP_SUBAGENT_ATTACH_TIMEOUT_MS;
 	#cancelCleanupTimeoutMs = ACP_CANCEL_CLEANUP_TIMEOUT_MS;
 	#blobs = new BlobStore(getBlobsDir());
@@ -666,6 +667,7 @@ export class AcpAgent implements Agent {
 	async initialize(params: InitializeRequest): Promise<InitializeResponse> {
 		this.#registerConnectionCleanup();
 		this.#clientCapabilities = params.clientCapabilities;
+		this.#subagentAttachState.waitForAutoLoad = params.clientCapabilities?._meta?.subagent_session_auto_load === true;
 		const authMethods: AuthMethod[] = [
 			{
 				id: "agent",
@@ -1449,6 +1451,7 @@ export class AcpAgent implements Agent {
 				rootSessionId,
 				rootAgentId,
 				options.subagentEventBus,
+				this.#subagentAttachState,
 				this.#subagentAttachTimeoutMs,
 			);
 			ownsSubagentBridge = true;
