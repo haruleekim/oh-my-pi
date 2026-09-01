@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import { truncate } from "@oh-my-pi/pi-utils";
 import type {
 	SessionNotification,
 	SessionUpdate,
@@ -132,7 +133,7 @@ interface TextMessageLike {
 	role?: unknown;
 }
 
-const ACP_TEXT_LIMIT = 4_000;
+const ACP_TOOL_TITLE_MAX_CHARS = 4_000;
 
 /**
  * Device name when the call is an `xd://` device dispatch riding the
@@ -537,7 +538,7 @@ function buildToolStartContent(toolName: string, args: unknown): ToolCallContent
 function buildToolStartText(toolName: string, args: unknown): string | undefined {
 	if (isCommandToolName(toolName)) {
 		const command = extractStringProperty<CommandContainer>(args, "command");
-		return command ? limitAcpText(`$ ${command}`) : undefined;
+		return command ? `$ ${command}` : undefined;
 	}
 	if (toolName === "eval") {
 		return buildEvalStartText(args);
@@ -571,7 +572,7 @@ function buildEvalStartText(args: unknown): string | undefined {
 		}
 		lines.push(title ? `[${language}] ${title}` : `[${language}]`, code);
 	}
-	return lines.length > 0 ? limitAcpText(lines.join("\n")) : undefined;
+	return lines.length > 0 ? lines.join("\n") : undefined;
 }
 
 function mergeToolUpdateContent(startContent: ToolCallContent[], resultContent: ToolCallContent[]): ToolCallContent[] {
@@ -597,32 +598,28 @@ function isCommandToolName(toolName: string): boolean {
 }
 
 function buildToolTitle(toolName: string, args: unknown, intent: string | undefined): string {
+	let title: string | undefined;
 	if (isCommandToolName(toolName)) {
-		const commandText = buildToolStartText(toolName, args);
-		if (commandText) return commandText;
+		title = buildToolStartText(toolName, args);
+	} else if (toolName === "eval") {
+		title = buildEvalStartText(args);
 	}
-	if (toolName === "eval") {
-		const evalText = buildEvalStartText(args);
-		if (evalText) return evalText;
-	}
-	const trimmedIntent = intent?.trim();
-	if (trimmedIntent) {
-		return trimmedIntent;
+	title ??= intent?.trim() || undefined;
+
+	if (!title) {
+		const subject =
+			extractStringProperty<PathContainer>(args, "path") ??
+			extractStringProperty<CommandContainer>(args, "command") ??
+			extractStringProperty<PatternContainer>(args, "pattern") ??
+			extractStringProperty<QueryContainer>(args, "query");
+		if (subject) {
+			// Internal URLs (xd://github, skill://react, …) name their target fully;
+			// prefixing the transport tool reads as a file write to a fake path.
+			title = INTERNAL_URL_SUBJECT.test(subject) ? subject : `${toolName}: ${subject}`;
+		}
 	}
 
-	const subject =
-		extractStringProperty<PathContainer>(args, "path") ??
-		extractStringProperty<CommandContainer>(args, "command") ??
-		extractStringProperty<PatternContainer>(args, "pattern") ??
-		extractStringProperty<QueryContainer>(args, "query");
-	if (subject) {
-		// Internal URLs (xd://github, skill://react, …) name their target fully;
-		// prefixing the transport tool reads as a file write to a fake path.
-		if (INTERNAL_URL_SUBJECT.test(subject)) return subject;
-		return `${toolName}: ${subject}`;
-	}
-
-	return toolName;
+	return truncate(title ?? toolName, ACP_TOOL_TITLE_MAX_CHARS);
 }
 
 /**
@@ -823,7 +820,7 @@ function toToolCallContent(value: unknown, options: AcpEventMapperOptions): Tool
 
 	switch (type) {
 		case "text": {
-			const text = extractStructuredText(value);
+			const text = extractStringProperty<TextLikeContent>(value, "text");
 			return text ? textToolCallContent(text) : undefined;
 		}
 		case "image":
@@ -1015,7 +1012,7 @@ function extractReadableText(value: unknown): string | undefined {
 	const contentBlocks = getContentBlocks(value);
 	if (contentBlocks) {
 		const text = contentBlocks
-			.map(block => extractStructuredText(block))
+			.map(block => extractStringProperty<TextLikeContent>(block, "text"))
 			.filter((chunk): chunk is string => typeof chunk === "string" && chunk.length > 0)
 			.join("\n");
 		if (text.length > 0) {
@@ -1058,17 +1055,9 @@ export function extractAssistantMessageText(value: unknown): string {
 		return "";
 	}
 	return content
-		.map(block => extractStructuredText(block))
+		.map(block => extractStringProperty<TextLikeContent>(block, "text"))
 		.filter((chunk): chunk is string => typeof chunk === "string" && chunk.length > 0)
 		.join("\n");
-}
-
-function extractStructuredText(value: unknown): string | undefined {
-	const text = extractStringProperty<TextLikeContent>(value, "text");
-	if (!text) {
-		return undefined;
-	}
-	return limitAcpText(text);
 }
 
 function getContentType(value: unknown): string | undefined {
@@ -1106,11 +1095,7 @@ function normalizeText(text: string | undefined): string | undefined {
 		return undefined;
 	}
 	const normalized = text.trim();
-	return normalized.length > 0 ? limitAcpText(normalized) : undefined;
-}
-
-export function limitAcpText(text: string): string {
-	return text.length > ACP_TEXT_LIMIT ? `${text.slice(0, ACP_TEXT_LIMIT - 1)}…` : text;
+	return normalized.length > 0 ? normalized : undefined;
 }
 
 function safeJsonStringify(value: unknown): string | undefined {

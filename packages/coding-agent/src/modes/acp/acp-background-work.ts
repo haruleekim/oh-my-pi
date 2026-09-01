@@ -17,7 +17,6 @@ import {
 import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
 import type { BashToolDetails } from "../../tools/bash";
 import { isLaunchToolDetails } from "../../tools/hub/launch";
-import { limitAcpText } from "./acp-event-mapper";
 
 const JOB_PROGRESS_COALESCE_MS = 100;
 const PROCESS_FOLLOW_TIMEOUT_MS = 30_000;
@@ -322,12 +321,7 @@ export class AcpBackgroundWorkBridge {
 			this.#jobs.set(message.toolCallId, tracker);
 			this.#jobToolCallsById.set(async.jobId, message.toolCallId);
 			const terminalText = live ? this.#terminalJobText(live) : undefined;
-			return withBackgroundMeta(
-				notification,
-				"background_job_info",
-				jobInfo(tracker),
-				terminalText ? limitAcpText(terminalText) : undefined,
-			);
+			return withBackgroundMeta(notification, "background_job_info", jobInfo(tracker), terminalText);
 		}
 
 		if (
@@ -365,7 +359,7 @@ export class AcpBackgroundWorkBridge {
 			if (result.op !== "logs") return notification;
 			cursor = result.cursor;
 			state = result.state;
-			if (result.text) logText = limitAcpText(result.text);
+			if (result.text) logText = result.text;
 		} catch (error) {
 			if (error instanceof DaemonBrokerRejectedError) return notification;
 			logger.debug("ACP background process probe failed", { processId: daemon.id, error });
@@ -430,8 +424,13 @@ export class AcpBackgroundWorkBridge {
 			tracker.status = status;
 			if (typeof value.startedAt === "number") tracker.startedAt = value.startedAt;
 			if (typeof value.durationMs === "number") tracker.durationMs = value.durationMs;
-			const preview = typeof value.resultPreview === "string" ? limitAcpText(value.resultPreview) : undefined;
-			void this.#emitJob(tracker, preview).catch(error => {
+			const resultText =
+				typeof value.result === "string"
+					? value.result
+					: typeof value.resultPreview === "string"
+						? value.resultPreview
+						: undefined;
+			void this.#emitJob(tracker, resultText).catch(error => {
 				logger.warn("Failed to replay ACP background job state", { jobId: tracker.jobId, error });
 			});
 		}
@@ -546,7 +545,7 @@ export class AcpBackgroundWorkBridge {
 			update: {
 				sessionUpdate: "tool_call_update",
 				toolCallId: tracker.toolCallId,
-				...(text ? { rawOutput: limitAcpText(text) } : {}),
+				...(text ? { rawOutput: text } : {}),
 				_meta: { background_job_info: jobInfo(tracker) },
 			},
 		};
@@ -560,7 +559,7 @@ export class AcpBackgroundWorkBridge {
 			update: {
 				sessionUpdate: "tool_call_update",
 				toolCallId: tracker.toolCallId,
-				...(text ? { rawOutput: limitAcpText(text) } : {}),
+				...(text ? { rawOutput: text } : {}),
 				_meta: { background_process_info: processInfo(tracker) },
 			},
 		};
@@ -649,7 +648,7 @@ export class AcpBackgroundWorkBridge {
 				tracker.state = result.state;
 				tracker.snapshot = { ...tracker.snapshot, state: result.state };
 			}
-			const text = result.text ? limitAcpText(result.text) : undefined;
+			const text = result.text || undefined;
 			if (text || tracker.state !== previousState) await this.#emitProcess(tracker, text);
 		}
 	}

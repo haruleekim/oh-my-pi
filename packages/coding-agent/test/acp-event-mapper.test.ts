@@ -141,8 +141,10 @@ describe("ACP event mapper", () => {
 		);
 	});
 
-	it("emits final assistant text when no text deltas were observed", () => {
-		const assistantMessage = makeAssistantMessage("final response");
+	it("emits final assistant text losslessly when no text deltas were observed", () => {
+		const marker = "MESSAGE-END-MARKER";
+		const text = `${"f".repeat(4_001 - marker.length)}${marker}`;
+		const assistantMessage = makeAssistantMessage(text);
 		const progress = { textEmitted: false, thoughtEmitted: false };
 
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
@@ -159,12 +161,37 @@ describe("ACP event mapper", () => {
 				sessionId: "session-1",
 				update: {
 					sessionUpdate: "agent_message_chunk",
-					content: { type: "text", text: "final response" },
+					content: { type: "text", text },
 					messageId: undefined,
 				},
 			},
 		]);
 		expectAcpNotifications(updates);
+		expect(progress.textEmitted).toBe(true);
+	});
+
+	it("emits completed assistant text losslessly when no text delta arrived", () => {
+		const marker = "DONE-END-MARKER";
+		const text = `${"d".repeat(4_001 - marker.length)}${marker}`;
+		const assistantMessage = makeAssistantMessage(text);
+		const progress = { textEmitted: false, thoughtEmitted: false };
+
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "message_update",
+				message: assistantMessage,
+				assistantMessageEvent: { type: "done", message: assistantMessage },
+			} as AgentSessionEvent,
+			"session-1",
+			{ getMessageProgress: message => (message === assistantMessage ? progress : undefined) },
+		);
+
+		expect(updates).toHaveLength(1);
+		expectAcpNotifications(updates);
+		expect(updates[0]?.update).toMatchObject({
+			sessionUpdate: "agent_message_chunk",
+			content: { type: "text", text },
+		});
 		expect(progress.textEmitted).toBe(true);
 	});
 
@@ -436,28 +463,59 @@ describe("ACP event mapper", () => {
 		expect(update.content).toEqual([{ type: "content", content: { type: "text", text: "[?]\nx\n[py]\ny" } }]);
 	});
 
-	it("limits eval source before emitting visible tool-call text", () => {
-		const source = "x".repeat(4_100);
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
-			{
-				type: "tool_execution_start",
-				toolCallId: "tc-eval-long-source",
-				toolName: "eval",
-				args: { language: "js", code: source },
-			} as AgentSessionEvent,
-			"session-1",
-		);
+	it("caps eval titles without truncating visible source content", () => {
+		for (const [sourceLength, titleEndsWithEllipsis] of [
+			[3_995, false],
+			[3_996, true],
+		] as const) {
+			const source = "x".repeat(sourceLength);
+			const visibleSource = `[js]\n${source}`;
+			const updates = mapAgentSessionEventToAcpSessionUpdates(
+				{
+					type: "tool_execution_start",
+					toolCallId: `tc-eval-long-source-${sourceLength}`,
+					toolName: "eval",
+					args: { language: "js", code: source },
+				} as AgentSessionEvent,
+				"session-1",
+			);
 
-		expect(updates).toHaveLength(1);
-		expectAcpNotifications(updates);
-		const update = updates[0]!.update as {
-			title: string;
-			content?: Array<{ type: string; content?: { type: string; text?: string } }>;
-		};
-		expect(update.title).toHaveLength(4_000);
-		expect(update.title.endsWith("…")).toBe(true);
-		expect(update.content).toEqual([{ type: "content", content: { type: "text", text: update.title } }]);
+			expect(updates).toHaveLength(1);
+			expectAcpNotifications(updates);
+			const update = updates[0]!.update as {
+				title: string;
+				content?: Array<{ type: string; content?: { type: string; text?: string } }>;
+				rawInput?: unknown;
+			};
+			expect(update.title).toHaveLength(4_000);
+			expect(update.title.endsWith("…")).toBe(titleEndsWithEllipsis);
+			expect(update.content).toEqual([{ type: "content", content: { type: "text", text: visibleSource } }]);
+			expect(update.rawInput).toEqual({ language: "js", code: source });
+		}
 	});
+
+	it("caps command titles at the boundary without truncating command content", () => {
+		for (const [commandLength, titleEndsWithEllipsis] of [
+			[3_998, false],
+			[3_999, true],
+		] as const) {
+			const command = "c".repeat(commandLength);
+			const visibleCommand = `$ ${command}`;
+			const update = buildToolCallStartUpdate({
+				toolCallId: `tc-command-title-${commandLength}`,
+				toolName: "bash",
+				args: { command },
+			}) as {
+				title: string;
+				content?: Array<{ type: string; content?: { type: string; text?: string } }>;
+			};
+
+			expect(update.title).toHaveLength(4_000);
+			expect(update.title.endsWith("…")).toBe(titleEndsWithEllipsis);
+			expect(update.content).toEqual([{ type: "content", content: { type: "text", text: visibleCommand } }]);
+		}
+	});
+
 	it("emits a diff ToolCallContent for each per-file edit result", () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
@@ -833,6 +891,40 @@ describe("ACP event mapper", () => {
 		};
 
 		expect(update.content).toEqual([{ type: "content", content: { type: "text", text: "hello from stdout" } }]);
+	});
+
+	it("keeps long readable tool output intact across result shapes", () => {
+		const marker = "TOOL-OUTPUT-END";
+		const text = `${"o".repeat(4_001 - marker.length)}${marker}`;
+		const jsonResult = { payload: text };
+		const cases: Array<{ name: string; result: unknown; expected: string }> = [
+			{ name: "plain", result: text, expected: text },
+			{ name: "structured", result: { content: [{ type: "text", text }] }, expected: text },
+			{ name: "message", result: { message: text }, expected: text },
+			{ name: "json", result: jsonResult, expected: JSON.stringify(jsonResult) },
+		];
+
+		for (const testCase of cases) {
+			const updates = mapAgentSessionEventToAcpSessionUpdates(
+				{
+					type: "tool_execution_end",
+					toolCallId: `tc-long-${testCase.name}`,
+					toolName: "custom",
+					isError: false,
+					result: testCase.result,
+				} as AgentSessionEvent,
+				"session-1",
+			);
+
+			expect(updates).toHaveLength(1);
+			expectAcpNotifications(updates);
+			const update = updates[0]!.update as {
+				content?: Array<{ type: string; content?: { type: string; text?: string } }>;
+				rawOutput?: unknown;
+			};
+			expect(update.rawOutput).toEqual(testCase.result);
+			expect(update.content).toEqual([{ type: "content", content: { type: "text", text: testCase.expected } }]);
+		}
 	});
 
 	it("embeds only terminal content from direct terminalId", () => {

@@ -6,6 +6,9 @@
  * run quiescence the task executor's barrier is built on.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
@@ -38,6 +41,7 @@ function observeAsyncResultEnqueue(session: AgentSession): Promise<void> {
 describe("AgentSession owner-routed async delivery", () => {
 	let session: AgentSession;
 	const authStorages: AuthStorage[] = [];
+	const tempDirs: string[] = [];
 
 	afterEach(async () => {
 		vi.useRealTimers();
@@ -46,6 +50,9 @@ describe("AgentSession owner-routed async delivery", () => {
 		}
 		for (const authStorage of authStorages.splice(0)) {
 			authStorage.close();
+		}
+		for (const dir of tempDirs.splice(0)) {
+			await fs.rm(dir, { recursive: true, force: true });
 		}
 		AsyncJobManager.resetForTests();
 	});
@@ -282,6 +289,8 @@ describe("AgentSession owner-routed async delivery", () => {
 			deferAgentInitiatedTurns: true,
 		});
 
+		const marker = "IDLE-RESULT-END";
+		const jobResult = `${"r".repeat(4_001 - marker.length)}${marker}`;
 		manager.register(
 			"task",
 			"BackgroundChild",
@@ -289,7 +298,7 @@ describe("AgentSession owner-routed async delivery", () => {
 				await reportProgress("Background child complete", {
 					results: [{ id: "BackgroundChild", sessionId: "child-session", isIsolated: false }],
 				});
-				return "IDLE ACP RESULT";
+				return jobResult;
 			},
 			{ id: "background-child", ownerId: "Main" },
 		);
@@ -307,6 +316,7 @@ describe("AgentSession owner-routed async delivery", () => {
 				jobs: [
 					{
 						jobId: "background-child",
+						result: jobResult,
 						details: {
 							results: [{ id: "BackgroundChild", sessionId: "child-session", isIsolated: false }],
 						},
@@ -318,7 +328,60 @@ describe("AgentSession owner-routed async delivery", () => {
 		await session.prompt("second client prompt");
 
 		expect(mock.calls).toHaveLength(1);
-		expect(JSON.stringify(mock.calls[0]!.context.messages)).toContain("IDLE ACP RESULT");
+		expect(JSON.stringify(mock.calls[0]!.context.messages)).toContain(jobResult);
+	});
+
+	it("persists artifact-backed async output with its recovery link", async () => {
+		const marker = "ARTIFACT-RESULT-END";
+		const jobResult = `${"a".repeat(12_001 - marker.length)}${marker}`;
+		const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-async-result-artifact-"));
+		tempDirs.push(tempRoot);
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			convertToLlm,
+			streamFn: mock.stream,
+		});
+		const authStorage = await AuthStorage.create(":memory:");
+		authStorages.push(authStorage);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const manager = new AsyncJobManager({});
+		AsyncJobManager.setInstance(manager);
+		const sessionManager = SessionManager.create(tempRoot, path.join(tempRoot, "sessions"));
+		await sessionManager.ensureOnDisk();
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry: new ModelRegistry(authStorage),
+			agentId: "Main",
+			asyncJobManager: manager,
+		});
+		session.setClientBridge({ capabilities: {}, deferAgentInitiatedTurns: true });
+
+		manager.register("bash", "oversized result", async () => jobResult, {
+			id: "oversized-result",
+			ownerId: "Main",
+		});
+		await manager.waitForOwnerJobs("Main");
+		await manager.drainDeliveries({ filter: { ownerId: "Main" } });
+
+		const persisted = sessionManager
+			.getEntries()
+			.find(entry => entry.type === "custom_message" && entry.customType === "async-result");
+		if (persisted?.type !== "custom_message") throw new Error("async result was not persisted");
+		const details = persisted.details as { jobs?: Array<{ result?: unknown }> } | undefined;
+		const formattedResult = details?.jobs?.[0]?.result;
+		if (typeof formattedResult !== "string") throw new Error("persisted async result has no result text");
+		expect(formattedResult).toContain(jobResult.slice(0, 4_000));
+		expect(formattedResult).toContain("[Output truncated. Showing first 4,000 characters.]");
+		const artifactMatch = formattedResult.match(/Full output: artifact:\/\/(\d+)$/);
+		expect(artifactMatch).not.toBeNull();
+		const artifactPath = await sessionManager.getArtifactPath(artifactMatch?.[1] ?? "");
+		if (!artifactPath) throw new Error("persisted async result artifact is unavailable");
+		expect(await Bun.file(artifactPath).text()).toBe(jobResult);
 	});
 
 	it("persists a UI-cancelled job with exact replay metadata and no unsolicited turn", async () => {
@@ -376,7 +439,7 @@ describe("AgentSession owner-routed async delivery", () => {
 						label: "cancel me",
 						status: "cancelled",
 						startedAt: job.startTime,
-						resultPreview: "",
+						result: "",
 					},
 				],
 			},

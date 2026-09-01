@@ -95,7 +95,13 @@ const daemon: DaemonSnapshot = {
 	detached: false,
 };
 
-function broker(capable: boolean): DaemonBrokerClient {
+interface BrokerOutputOptions {
+	initialText?: string;
+	followText?: string;
+}
+
+function broker(capable: boolean, options: BrokerOutputOptions = {}): DaemonBrokerClient {
+	let snapshot = daemon;
 	return {
 		projectDir: process.cwd(),
 		onCompletion: () => () => {},
@@ -109,18 +115,29 @@ function broker(capable: boolean): DaemonBrokerClient {
 						...(capable ? { capabilities: { processIdentityCompare: true as const } } : {}),
 					};
 					break;
-				case "logs":
+				case "logs": {
+					const followedText = operation.follow === true ? options.followText : undefined;
+					const text = followedText ?? options.initialText ?? "ready\n";
+					if (followedText !== undefined) {
+						snapshot = {
+							...daemon,
+							state: "exited",
+							exitedAt: 4,
+							outputBytes: daemon.outputBytes + text.length,
+						};
+					}
 					result = {
 						op: "logs",
-						name: daemon.name,
-						text: "ready\n",
-						cursor: daemon.outputBytes,
+						name: snapshot.name,
+						text,
+						cursor: snapshot.outputBytes,
 						timedOut: false,
-						state: daemon.state,
+						state: snapshot.state,
 					};
 					break;
+				}
 				case "list":
-					result = { op: "list", daemons: [daemon] };
+					result = { op: "list", daemons: [snapshot] };
 					break;
 				default:
 					throw new Error(`Unexpected broker operation ${operation.op}`);
@@ -143,13 +160,17 @@ describe("ACP background work bridge", () => {
 		const progress = Promise.withResolvers<void>();
 		const finish = Promise.withResolvers<string>();
 		const progressReported = Promise.withResolvers<void>();
+		const progressMarker = "JOB-PROGRESS-END";
+		const progressText = `${"z".repeat(4_500 - progressMarker.length)}${progressMarker}`;
+		const finalMarker = "JOB-FINAL-END";
+		const finalText = `${"f".repeat(4_001 - finalMarker.length)}${finalMarker}`;
 		manager.register(
 			"bash",
 			"bun run build",
 			async ({ reportProgress }) => {
 				await progress.promise;
 				await reportProgress("old tail");
-				await reportProgress("z".repeat(4_500));
+				await reportProgress(progressText);
 				progressReported.resolve();
 				return finish.promise;
 			},
@@ -178,15 +199,14 @@ describe("ACP background work bridge", () => {
 		if (progressUpdate.sessionUpdate !== "tool_call_update" || typeof progressUpdate.rawOutput !== "string") {
 			throw new Error("expected background progress tool update");
 		}
-		expect(progressUpdate.rawOutput).toHaveLength(4_000);
-		expect(progressUpdate.rawOutput.endsWith("…")).toBe(true);
+		expect(progressUpdate.rawOutput).toBe(progressText);
 		expect(updates.some(update => backgroundJobInfo(update)?.job_id === "bg-other")).toBe(false);
 
-		finish.resolve("final output");
+		finish.resolve(finalText);
 		await manager.waitForAll();
 		await waitForUpdates(updates, 3);
 		expect(backgroundJobInfo(updates[2]!)).toMatchObject({ status: "completed" });
-		expect(updates[2]!.update).toMatchObject({ rawOutput: "final output" });
+		expect(updates[2]!.update).toMatchObject({ rawOutput: finalText });
 		await bridge.dispose();
 		await manager.dispose();
 	});
@@ -253,6 +273,8 @@ describe("ACP background work bridge", () => {
 
 	it("starts a fresh replay tracker when a later tool call reuses a job id", async () => {
 		const { bridge, updates } = harness({ _meta: { background_job_info: true } });
+		const replayMarker = "REPLAY-RESULT-END";
+		const replayResult = `${"r".repeat(4_001 - replayMarker.length)}${replayMarker}`;
 		bridge.beginReplay();
 		const oldDecorated = await bridge.decorateReplayedToolUpdate(
 			{
@@ -270,7 +292,8 @@ describe("ACP background work bridge", () => {
 					status: "completed",
 					startedAt: 100,
 					durationMs: 250,
-					resultPreview: "old result",
+					result: replayResult,
+					resultPreview: "stale preview",
 				},
 			],
 		});
@@ -300,7 +323,7 @@ describe("ACP background work bridge", () => {
 				update.update.toolCallId === "tool-old" &&
 				backgroundJobInfo(update)?.status === "completed",
 		);
-		expect(oldTerminal?.update).toMatchObject({ rawOutput: "old result" });
+		expect(oldTerminal?.update).toMatchObject({ rawOutput: replayResult });
 		expect(backgroundJobInfo(oldTerminal!)).toMatchObject({ job_type: "eval", status: "completed" });
 		const newTerminal = updates.find(
 			update =>
@@ -312,11 +335,67 @@ describe("ACP background work bridge", () => {
 		await bridge.dispose();
 	});
 
+	it("replays legacy result previews when persisted full output is unavailable", async () => {
+		const marker = "LEGACY-PREVIEW-END";
+		const legacyPreview = `${"l".repeat(4_000 - marker.length)}${marker}`;
+		const { bridge, updates } = harness({ _meta: { background_job_info: true } });
+		bridge.beginReplay();
+		const decorated = await bridge.decorateReplayedToolUpdate(
+			{
+				toolCallId: "tool-legacy",
+				toolName: "bash",
+				details: { async: { state: "running", jobId: "legacy-job", type: "bash" } },
+			},
+			baseToolUpdate("tool-legacy"),
+		);
+		await bridge.deliver(decorated);
+		bridge.recordReplayedAsyncResult({
+			jobs: [{ jobId: "legacy-job", status: "completed", resultPreview: legacyPreview }],
+		});
+		await bridge.finishReplay(true);
+
+		const terminal = updates.find(
+			update =>
+				update.update.sessionUpdate === "tool_call_update" &&
+				update.update.toolCallId === "tool-legacy" &&
+				backgroundJobInfo(update)?.status === "completed",
+		);
+		expect(terminal?.update).toMatchObject({ rawOutput: legacyPreview });
+		await bridge.dispose();
+	});
+
+	it("passes initial and followed process log tails without truncation", async () => {
+		const initialMarker = "PROCESS-INITIAL-END";
+		const initialText = `${"i".repeat(4_001 - initialMarker.length)}${initialMarker}`;
+		const followMarker = "PROCESS-FOLLOW-END";
+		const followText = `${"p".repeat(4_001 - followMarker.length)}${followMarker}`;
+		vi.spyOn(daemonClient, "daemonClientForProject").mockResolvedValue(broker(true, { initialText, followText }));
+		const { bridge, updates } = harness({ _meta: { background_process_info: true } });
+		const processEvent: AgentSessionEvent = {
+			type: "tool_execution_end",
+			toolCallId: "process-lossless",
+			toolName: "hub",
+			isError: false,
+			result: { content: [], details: { op: "start", daemon } },
+		};
+
+		const decorated = await bridge.decorateLiveToolUpdate(processEvent, baseToolUpdate("process-lossless"));
+		expect(decorated.update).toMatchObject({ rawOutput: initialText });
+		await bridge.deliver(decorated);
+		await waitForUpdates(updates, 2);
+		expect(updates[1]?.update).toMatchObject({ rawOutput: followText });
+		expect(backgroundProcessInfo(updates[1]!)).toMatchObject({ state: "exited" });
+		await bridge.dispose();
+	});
+
 	it("gates job and process metadata independently and keeps legacy brokers generic", async () => {
 		expect(clientSupportsBackgroundWork(undefined)).toBe(false);
 		expect(clientSupportsBackgroundWork({ _meta: { background_job_info: "true" } })).toBe(false);
 		const manager = new AsyncJobManager({});
-		manager.register("bash", "job", async () => "done", { id: "job-1", ownerId: OWNER_ID });
+		const terminalMarker = "DECORATED-JOB-END";
+		const terminalText = `${"t".repeat(4_001 - terminalMarker.length)}${terminalMarker}`;
+		manager.register("bash", "job", async () => terminalText, { id: "job-1", ownerId: OWNER_ID });
+		await manager.waitForAll();
 
 		const jobOnly = harness({ _meta: { background_job_info: true } }, manager);
 		const jobDecorated = await jobOnly.bridge.decorateLiveToolUpdate(
@@ -324,6 +403,7 @@ describe("ACP background work bridge", () => {
 			baseToolUpdate("job-tool"),
 		);
 		expect(backgroundJobInfo(jobDecorated)).toBeDefined();
+		expect(jobDecorated.update).toMatchObject({ rawOutput: terminalText });
 		const taskDecorated = await jobOnly.bridge.decorateLiveToolUpdate(
 			{
 				type: "tool_execution_end",

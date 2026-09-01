@@ -22,8 +22,9 @@ import { truncateMiddle } from "./streaming-output";
  */
 export const ASYNC_RESULT_MESSAGE_TYPE = "async-result";
 
-/** Result payloads longer than this spill to an artifact with an inline preview. */
+/** Maximum result length kept inline before spilling the full output to an artifact. */
 export const ASYNC_INLINE_RESULT_MAX_CHARS = 12_000;
+/** Characters retained in the explicit inline preview after an artifact spill. */
 export const ASYNC_PREVIEW_MAX_CHARS = 4_000;
 
 export interface AsyncResultEntry {
@@ -50,7 +51,7 @@ export type AsyncResultJobDetails = {
 	durationMs?: number;
 	/** Full structured payload (source/mode/status/data/error), when the job used an output schema. */
 	schema?: StructuredSubagentOutput;
-	resultPreview?: string;
+	result: string;
 	details?: Record<string, unknown>;
 };
 
@@ -96,7 +97,6 @@ export function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): Custo
 			status: entry.job?.status,
 			startedAt: entry.job?.startTime,
 			durationMs: entry.durationMs,
-			resultPreview: entry.result.slice(0, ASYNC_PREVIEW_MAX_CHARS),
 			details: entry.job?.latestDetails,
 			cancelled: entry.job?.status === "cancelled",
 			structured,
@@ -116,7 +116,7 @@ export function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): Custo
 			startedAt: job.startedAt,
 			durationMs: job.durationMs,
 			...(job.structured ? { schema: job.structured } : {}),
-			resultPreview: job.resultPreview,
+			result: job.result,
 			details: job.details,
 		})),
 	};

@@ -1527,7 +1527,9 @@ describe("ACP agent", () => {
 		// the agent_end flush: thinking streams, then the turn ends. No
 		// text_delta and no message_end ever reach this subscriber — the final
 		// text exists only on the agent_end payload.
-		const assistantMessage = makeAssistantMessage("Final visible answer.", "Considering the greeting.");
+		const marker = "AGENT-END-MARKER";
+		const finalText = `${"a".repeat(4_001 - marker.length)}${marker}`;
+		const assistantMessage = makeAssistantMessage(finalText, "Considering the greeting.");
 		session.prompt = async (text: string): Promise<boolean> => {
 			session.promptCalls.push(text);
 			session.isStreaming = true;
@@ -1563,7 +1565,7 @@ describe("ACP agent", () => {
 		expect(messageChunks[0]?.update).toEqual(
 			expect.objectContaining({
 				sessionUpdate: "agent_message_chunk",
-				content: { type: "text", text: "Final visible answer." },
+				content: { type: "text", text: finalText },
 			}),
 		);
 		// Flushed answer belongs to the same live message as the thought chunk.
