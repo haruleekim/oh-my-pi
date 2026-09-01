@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { setProcessName, TempDir } from "@oh-my-pi/pi-utils";
 import { startDaemonBrokerFromEnvironment } from "../../src/launch/broker";
-import { createDaemonBrokerClient } from "../../src/launch/client";
+import { createDaemonBrokerClient, DaemonBrokerRejectedError } from "../../src/launch/client";
 import {
 	DAEMON_IDLE_GRACE_ENV,
 	DAEMON_PROJECT_DIR_ENV,
@@ -79,6 +79,38 @@ process.stdin.on("data", () => process.stdout.write("AFTER-SNAPSHOT\\n"));
 			});
 			if (started.op !== "start") throw new Error("unexpected start result");
 			expect(started.readyTimedOut).toBeFalse();
+			const ping = await client.request({ op: "ping" });
+			if (ping.op !== "ping") throw new Error("unexpected ping result");
+			expect(ping.capabilities).toEqual({ processIdentityCompare: true });
+			const staleLogsError = await client
+				.request({
+					op: "logs",
+					name: "cursor",
+					processId: "stale-process-id",
+					lines: 20,
+					head: false,
+					follow: false,
+					timeoutMs: 1_000,
+				})
+				.then(
+					() => undefined,
+					error => error,
+				);
+			expect(staleLogsError).toBeInstanceOf(DaemonBrokerRejectedError);
+			expect((staleLogsError as Error).message).toContain("Daemon cursor launch identity changed");
+			const staleStopError = await client
+				.request({
+					op: "stop",
+					name: "cursor",
+					processId: "stale-process-id",
+					timeoutMs: 1_000,
+				})
+				.then(
+					() => undefined,
+					error => error,
+				);
+			expect(staleStopError).toBeInstanceOf(DaemonBrokerRejectedError);
+			expect((staleStopError as Error).message).toContain("Daemon cursor launch identity changed");
 
 			const snapshotPromise = client.request({
 				op: "logs",
@@ -119,6 +151,23 @@ process.stdin.on("data", () => process.stdout.write("AFTER-SNAPSHOT\\n"));
 			if (followed.op !== "logs") throw new Error("unexpected follow result");
 			expect(followed.timedOut).toBeFalse();
 			expect(followed.text).toContain("AFTER-SNAPSHOT");
+
+			const stopped = await client.request({
+				op: "stop",
+				name: "cursor",
+				processId: started.daemon.id,
+				timeoutMs: 2_000,
+			});
+			if (stopped.op !== "stop") throw new Error("unexpected stop result");
+			expect(stopped.stopped).toBeTrue();
+			const alreadyTerminal = await client.request({
+				op: "stop",
+				name: "cursor",
+				processId: started.daemon.id,
+				timeoutMs: 2_000,
+			});
+			if (alreadyTerminal.op !== "stop") throw new Error("unexpected stop result");
+			expect(alreadyTerminal.stopped).toBeFalse();
 		} finally {
 			releaseRender.resolve();
 			await client.request({ op: "stop", name: "cursor", timeoutMs: 2_000 }).catch(() => undefined);

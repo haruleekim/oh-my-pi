@@ -64,6 +64,88 @@ describe("AsyncJobManager", () => {
 		expect(manager.getJob(jobId)?.status).toBe("completed");
 	});
 
+	test("subscribes to owner-scoped progress and terminal lifecycle updates", async () => {
+		const manager = new AsyncJobManager({});
+		const events: Array<{ id: string; status: string; text?: string }> = [];
+		const unsubscribe = manager.subscribe({ ownerId: "Main" }, (job, text) => {
+			events.push({ id: job.id, status: job.status, text });
+		});
+
+		manager.register(
+			"bash",
+			"main-completes",
+			async ({ reportProgress }) => {
+				await reportProgress("live tail", { async: { state: "running" } });
+				return "complete output";
+			},
+			{ id: "main-complete", ownerId: "Main" },
+		);
+		manager.register(
+			"eval",
+			"main-fails",
+			async () => {
+				throw new Error("eval failed");
+			},
+			{ id: "main-failed", ownerId: "Main" },
+		);
+		manager.register("bash", "other-owner", async () => "private output", {
+			id: "other-complete",
+			ownerId: "Other",
+		});
+
+		await manager.waitForAll();
+		expect(events.filter(event => event.id === "main-complete")).toEqual([
+			{ id: "main-complete", status: "running", text: "live tail" },
+			{ id: "main-complete", status: "completed", text: "complete output" },
+		]);
+		expect(events.filter(event => event.id === "main-failed")).toEqual([
+			{ id: "main-failed", status: "failed", text: "eval failed" },
+		]);
+		expect(events.some(event => event.id === "other-complete")).toBe(false);
+
+		unsubscribe();
+		manager.register("bash", "after-unsubscribe", async () => "ignored", {
+			id: "main-after-unsubscribe",
+			ownerId: "Main",
+		});
+		await manager.waitForAll();
+		expect(events.some(event => event.id === "main-after-unsubscribe")).toBe(false);
+	});
+
+	test("notifies cancellation through cancel, cancelAll, and dispose", async () => {
+		const manager = new AsyncJobManager({});
+		const cancelled: string[] = [];
+		manager.subscribe({ ownerId: "Main" }, job => {
+			if (job.status === "cancelled") cancelled.push(job.id);
+		});
+		const waitForAbort = (signal: AbortSignal): Promise<string> => {
+			const { promise, resolve } = Promise.withResolvers<string>();
+			signal.addEventListener("abort", () => resolve("stopped"), { once: true });
+			return promise;
+		};
+
+		manager.register("bash", "single", ({ signal }) => waitForAbort(signal), {
+			id: "cancel-single",
+			ownerId: "Main",
+		});
+		expect(manager.cancel("cancel-single", { ownerId: "Main" })).toBe(true);
+
+		manager.register("eval", "owner batch", ({ signal }) => waitForAbort(signal), {
+			id: "cancel-owner",
+			ownerId: "Main",
+		});
+		manager.cancelAll({ ownerId: "Main" });
+		await manager.waitForAll();
+
+		manager.register("bash", "dispose", ({ signal }) => waitForAbort(signal), {
+			id: "cancel-dispose",
+			ownerId: "Main",
+		});
+		await manager.dispose();
+
+		expect(cancelled).toEqual(["cancel-single", "cancel-owner", "cancel-dispose"]);
+	});
+
 	test("swallows progress callback errors without failing the job", async () => {
 		const completions: Array<{ jobId: string; text: string }> = [];
 		const manager = new AsyncJobManager({

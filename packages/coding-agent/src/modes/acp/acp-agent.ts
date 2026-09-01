@@ -58,6 +58,8 @@ import { getSessionSlashCommands } from "../../extensibility/extensions/get-comm
 import { buildSkillPromptMessage, parseSkillInvocation } from "../../extensibility/skills";
 import { loadSlashCommands } from "../../extensibility/slash-commands";
 import { resolveLocalUrlToPath } from "../../internal-urls";
+import { DaemonBrokerRejectedError, daemonClientForProject } from "../../launch/client";
+import type { DaemonRpcResult } from "../../launch/protocol";
 import { MCPManager } from "../../mcp/manager";
 import type { MCPServerConfig } from "../../mcp/types";
 import { loadAllExtensions } from "../../modes/components/extensions/state-manager";
@@ -66,6 +68,7 @@ import { normalizePlanTitle, type PlanApprovalDetails, resolveApprovedPlan } fro
 import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "../../session/async-job-delivery";
 import { BlobStore, resolveImageDataSync } from "../../session/blob-store";
+import { LAUNCH_COMPLETION_MESSAGE_TYPE } from "../../session/launch-completion";
 import { isSilentAbort, SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
 import type { UsageStatistics } from "../../session/session-entries";
 import type { SessionInfo as StoredSessionInfo } from "../../session/session-listing";
@@ -86,6 +89,13 @@ import {
 } from "../../tts/models";
 import type { EventBus } from "../../utils/event-bus";
 import { canonicalizeMessage } from "../../utils/thinking-display";
+import {
+	AcpBackgroundWorkBridge,
+	BACKGROUND_JOB_CANCEL_METHOD,
+	BACKGROUND_PROCESS_STOP_METHOD,
+	type BackgroundWorkResult,
+	clientSupportsBackgroundWork,
+} from "./acp-background-work";
 import { createAcpClientBridge } from "./acp-client-bridge";
 import {
 	extractAssistantMessageText,
@@ -174,6 +184,7 @@ type ManagedSessionRecord = {
 	ownership: "root" | "cold" | "borrowed";
 	subagentBridge: AcpSubagentBridge | undefined;
 	ownsSubagentBridge: boolean;
+	backgroundBridge: AcpBackgroundWorkBridge | undefined;
 	mcpManager: MCPManager | undefined;
 	// Ordered queue of MCP tool refreshes for this record. Rebuilt per
 	// `#configureMcpServers` call; drained on reconfigure so a stale in-flight
@@ -708,6 +719,10 @@ export class AcpAgent implements Agent {
 					resume: {},
 					close: {},
 				},
+				_meta: {
+					background_job_cancel: true,
+					background_process_stop: true,
+				},
 			},
 		};
 	}
@@ -739,17 +754,22 @@ export class AcpAgent implements Agent {
 	async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
 		this.#assertAbsoluteCwd(params.cwd);
 		const record = await this.#loadManagedSession(params.sessionId, params.cwd, params.mcpServers);
+		record.backgroundBridge?.beginReplay();
+		let replaySuccess = false;
 		try {
 			await this.#replaySessionHistory(record);
 			if (record.ownership === "borrowed") {
 				await record.subagentBridge?.completeBorrowedAttach(params.sessionId);
 			}
+			replaySuccess = true;
 		} catch (error) {
 			if (record.ownership === "borrowed") {
 				this.#sessions.delete(params.sessionId);
 				record.subagentBridge?.failBorrowedAttach(params.sessionId);
 			}
 			throw error;
+		} finally {
+			await record.backgroundBridge?.finishReplay(replaySuccess);
 		}
 		const response: LoadSessionResponse = {
 			configOptions: this.#buildConfigOptions(record.session),
@@ -1197,6 +1217,10 @@ export class AcpAgent implements Agent {
 		switch (method) {
 			case SPEECH_MODELS_LIST_METHOD:
 				return buildAcpSpeechModelsCatalog();
+			case BACKGROUND_JOB_CANCEL_METHOD:
+				return this.#cancelBackgroundJob(params);
+			case BACKGROUND_PROCESS_STOP_METHOD:
+				return this.#stopBackgroundProcess(params);
 			case "_omp/sessions/listAll": {
 				const limit = typeof params.limit === "number" ? Math.max(1, Math.min(5000, params.limit as number)) : 1000;
 				const sessions = await SessionManager.listAll();
@@ -1271,6 +1295,73 @@ export class AcpAgent implements Agent {
 			default:
 				throw new Error(`Unknown ACP ext method: ${method}`);
 		}
+	}
+
+	async #cancelBackgroundJob(params: Record<string, unknown>): Promise<BackgroundWorkResult> {
+		const sessionId = this.#requiredBackgroundParam(params, "sessionId");
+		const jobId = this.#requiredBackgroundParam(params, "jobId");
+		const record = this.#getSessionRecord(sessionId);
+		const ownerId = record.ownership === "root" ? record.session.getAgentId() : undefined;
+		const manager = record.session.asyncJobManager;
+		const job = manager?.getJob(jobId);
+		if (!manager || !ownerId || !job || job.ownerId !== ownerId) {
+			throw RequestError.invalidParams(undefined, "Background job is unavailable for this session");
+		}
+		if (job.status !== "running") return { outcome: "already_terminal" };
+		if (!manager.cancel(jobId, { ownerId })) {
+			if (job.status !== "running") return { outcome: "already_terminal" };
+			throw RequestError.invalidParams(undefined, "Background job is unavailable for this session");
+		}
+		await record.session.recordAsyncJobCancellation(job);
+		return { outcome: "cancelled" };
+	}
+
+	async #stopBackgroundProcess(params: Record<string, unknown>): Promise<BackgroundWorkResult> {
+		const sessionId = this.#requiredBackgroundParam(params, "sessionId");
+		const name = this.#requiredBackgroundParam(params, "name");
+		const processId = this.#requiredBackgroundParam(params, "processId");
+		const record = this.#getSessionRecord(sessionId);
+		if (record.ownership !== "root") {
+			throw RequestError.invalidParams(undefined, "Background process is unavailable for this session");
+		}
+		const owner = record.session.sessionManager.getSessionId();
+		const client = await daemonClientForProject(record.session.sessionManager.getCwd());
+		const listed = await client.request({ op: "list" });
+		const daemon =
+			listed.op === "list"
+				? listed.daemons.find(item => item.name === name && item.id === processId && item.owner === owner)
+				: undefined;
+		if (!daemon) {
+			throw RequestError.invalidParams(undefined, "Background process is unavailable for this session");
+		}
+		if (daemon.state === "exited" || daemon.state === "failed") return { outcome: "already_terminal" };
+		let stopped: DaemonRpcResult;
+		try {
+			stopped = await client.request({ op: "stop", name, processId, timeoutMs: 5_000 });
+		} catch (error) {
+			if (!(error instanceof DaemonBrokerRejectedError)) throw error;
+			const refreshed = await client.request({ op: "list" });
+			const current =
+				refreshed.op === "list"
+					? refreshed.daemons.find(item => item.id === processId && item.owner === owner)
+					: undefined;
+			if (current && (current.state === "exited" || current.state === "failed")) {
+				return { outcome: "already_terminal" };
+			}
+			throw RequestError.invalidParams(undefined, "Background process is unavailable for this session");
+		}
+		if (stopped.op !== "stop" || !stopped.stopped) return { outcome: "already_terminal" };
+		await record.backgroundBridge?.markProcessCancelled(processId, stopped.daemon);
+		await record.session.recordStoppedLaunchProcess(stopped.daemon);
+		return { outcome: "cancelled" };
+	}
+
+	#requiredBackgroundParam(params: Record<string, unknown>, key: string): string {
+		const value = params[key];
+		if (typeof value !== "string" || value.length === 0) {
+			throw RequestError.invalidParams(undefined, `${key} must be a non-empty string`);
+		}
+		return value;
 	}
 
 	async extNotification(_method: string, _params: { [key: string]: unknown }): Promise<void> {}
@@ -1465,6 +1556,14 @@ export class AcpAgent implements Agent {
 			subagentBridge,
 			ownsSubagentBridge,
 		);
+		if (ownership === "root" && clientSupportsBackgroundWork(this.#clientCapabilities)) {
+			record.backgroundBridge = new AcpBackgroundWorkBridge(
+				this.#connection,
+				session,
+				this.#clientCapabilities,
+				session.asyncJobManager ?? this.#asyncJobManager,
+			);
+		}
 		session.setClientBridge(
 			createAcpClientBridge(this.#connection, session.sessionManager.getSessionId(), this.#clientCapabilities, {
 				deferAgentInitiatedTurns: ownership === "root",
@@ -1498,6 +1597,7 @@ export class AcpAgent implements Agent {
 			ownership,
 			subagentBridge,
 			ownsSubagentBridge,
+			backgroundBridge: undefined,
 			mcpManager: undefined,
 			mcpRefreshChain: undefined,
 			promptTurn: undefined,
@@ -1595,14 +1695,19 @@ export class AcpAgent implements Agent {
 			event.type === "message_update" &&
 			event.message.role === "assistant" &&
 			event.assistantMessageEvent.type === "error";
-		for (const notification of mapAgentSessionEventToAcpSessionUpdates(event, record.session.sessionId, {
+		for (const mapped of mapAgentSessionEventToAcpSessionUpdates(event, record.session.sessionId, {
 			getMessageId: message => this.#getLiveMessageId(record, message),
 			getMessageProgress: message => this.#getLiveMessageProgress(record, message),
 			getToolArgs: toolCallId => record.toolArgsById.get(toolCallId),
 			cwd: record.session.sessionManager.getCwd(),
 			resolveImageData: resolveImageDataForAcp,
 		})) {
-			const delivery = this.#connection.sessionUpdate(notification);
+			const notification = record.backgroundBridge
+				? await record.backgroundBridge.decorateLiveToolUpdate(event, mapped)
+				: mapped;
+			const delivery = record.backgroundBridge
+				? record.backgroundBridge.deliver(notification)
+				: this.#connection.sessionUpdate(notification);
 			if (streamedAssistantError) {
 				// Resolves true only once the error chunk actually reached the
 				// client — a failed delivery keeps the agent_end fallback armed.
@@ -2421,14 +2526,31 @@ export class AcpAgent implements Agent {
 		const messages =
 			record.replayMessages ?? (record.session.sessionManager.buildSessionContext().messages as ReplayableMessage[]);
 		for (const message of messages) {
-			for (const notification of this.#messageToReplayNotifications(
+			for (const mapped of this.#messageToReplayNotifications(
 				record.wireSessionId,
 				message,
 				cwd,
 				replayedToolCallIds,
 				replayedToolCallArgs,
 			)) {
-				await this.#connection.sessionUpdate(notification);
+				const notification =
+					record.backgroundBridge &&
+					message.role === "toolResult" &&
+					typeof message.toolCallId === "string" &&
+					typeof message.toolName === "string"
+						? await record.backgroundBridge.decorateReplayedToolUpdate(
+								{
+									toolCallId: message.toolCallId,
+									toolName: message.toolName,
+									details: message.details,
+									content: message.content,
+									isError: message.isError,
+								},
+								mapped,
+							)
+						: mapped;
+				if (record.backgroundBridge) await record.backgroundBridge.deliver(notification);
+				else await this.#connection.sessionUpdate(notification);
 			}
 			if (message.role === "toolResult" && message.toolName === "task") {
 				await record.subagentBridge?.recordTaskResults(record.session, record.wireSessionId, message.details);
@@ -2443,6 +2565,12 @@ export class AcpAgent implements Agent {
 					if (!isRecord(job) || !isRecord(job.details)) continue;
 					await record.subagentBridge?.recordTaskResults(record.session, record.wireSessionId, job.details);
 				}
+			}
+			if (message.role === "custom" && message.customType === ASYNC_RESULT_MESSAGE_TYPE) {
+				record.backgroundBridge?.recordReplayedAsyncResult(message.details);
+			}
+			if (message.role === "custom" && message.customType === LAUNCH_COMPLETION_MESSAGE_TYPE) {
+				record.backgroundBridge?.recordReplayedLaunchCompletion(message.details);
 			}
 		}
 		record.replayMessages = undefined;
@@ -2977,6 +3105,11 @@ export class AcpAgent implements Agent {
 			await record.session.dispose({ reason });
 		} catch (error) {
 			logger.warn("Failed to dispose ACP session", { error });
+		}
+		try {
+			await record.backgroundBridge?.dispose();
+		} catch (error) {
+			logger.warn("Failed to dispose ACP background work bridge", { error });
 		}
 	}
 

@@ -78,6 +78,8 @@ export type DaemonOperation =
 	| {
 			op: "logs";
 			name: string;
+			/** Bind internal observations to one launch identity; omitted by model-facing operations. */
+			processId?: string;
 			lines: number;
 			head: boolean;
 			grep?: string;
@@ -89,14 +91,14 @@ export type DaemonOperation =
 	  }
 	| { op: "wait"; name: string; for: "ready" | "exit"; pattern?: string; timeoutMs: number }
 	| { op: "send"; name: string; data?: string; signal?: DaemonSignal }
-	| { op: "stop"; name: string; timeoutMs: number }
+	| { op: "stop"; name: string; processId?: string; timeoutMs: number }
 	| { op: "restart"; name: string }
 	| { op: "describe"; name: string }
 	| { op: "shutdown" };
 
 /** Typed broker result decoded before it reaches tool code. */
 export type DaemonRpcResult =
-	| { op: "ping"; projectDir: string }
+	| { op: "ping"; projectDir: string; capabilities?: { processIdentityCompare: true } }
 	| { op: "start"; daemon: DaemonSnapshot; readyTimedOut: boolean }
 	| { op: "list"; daemons: DaemonSnapshot[] }
 	| {
@@ -113,7 +115,7 @@ export type DaemonRpcResult =
 	  }
 	| { op: "wait"; daemon: DaemonSnapshot; matched?: string; timedOut: boolean }
 	| { op: "send"; daemon: DaemonSnapshot }
-	| { op: "stop"; daemon: DaemonSnapshot }
+	| { op: "stop"; daemon: DaemonSnapshot; stopped: boolean }
 	| { op: "restart"; daemon: DaemonSnapshot }
 	| { op: "describe"; daemon: DaemonSnapshot; spec: DaemonSpec }
 	| { op: "shutdown" };
@@ -356,6 +358,7 @@ function parseDaemonOperation(value: unknown): DaemonOperation {
 			return {
 				op,
 				name: stringValue(source.name, "operation.name"),
+				processId: optionalString(source.processId, "operation.processId"),
 				lines: numberValue(source.lines, "operation.lines"),
 				head: booleanValue(source.head, "operation.head"),
 				grep: optionalString(source.grep, "operation.grep"),
@@ -389,6 +392,7 @@ function parseDaemonOperation(value: unknown): DaemonOperation {
 			return {
 				op,
 				name: stringValue(source.name, "operation.name"),
+				processId: optionalString(source.processId, "operation.processId"),
 				timeoutMs: numberValue(source.timeoutMs, "operation.timeoutMs"),
 			};
 		case "restart":
@@ -403,8 +407,20 @@ function parseDaemonOperation(value: unknown): DaemonOperation {
 export function parseDaemonRpcResult(operation: DaemonOperation, value: unknown): DaemonRpcResult {
 	const source = record(value, `${operation.op} result`);
 	switch (operation.op) {
-		case "ping":
-			return { op: "ping", projectDir: stringValue(source.projectDir, "result.projectDir") };
+		case "ping": {
+			if (source.capabilities === undefined) {
+				return { op: "ping", projectDir: stringValue(source.projectDir, "result.projectDir") };
+			}
+			const capabilities = record(source.capabilities, "result.capabilities");
+			if (booleanValue(capabilities.processIdentityCompare, "result.capabilities.processIdentityCompare") !== true) {
+				throw new Error("result.capabilities.processIdentityCompare must be true");
+			}
+			return {
+				op: "ping",
+				projectDir: stringValue(source.projectDir, "result.projectDir"),
+				capabilities: { processIdentityCompare: true },
+			};
+		}
 		case "start":
 			return {
 				op: "start",
@@ -438,7 +454,11 @@ export function parseDaemonRpcResult(operation: DaemonOperation, value: unknown)
 		case "send":
 			return { op: "send", daemon: parseDaemonSnapshot(source.daemon) };
 		case "stop":
-			return { op: "stop", daemon: parseDaemonSnapshot(source.daemon) };
+			return {
+				op: "stop",
+				daemon: parseDaemonSnapshot(source.daemon),
+				stopped: source.stopped === undefined ? true : booleanValue(source.stopped, "result.stopped"),
+			};
 		case "restart":
 			return { op: "restart", daemon: parseDaemonSnapshot(source.daemon) };
 		case "describe":

@@ -201,6 +201,7 @@ describe("launch broker protocol compatibility", () => {
 						persist: true,
 						detached: false,
 					},
+					stopped: true,
 				} as const;
 			},
 			close() {},

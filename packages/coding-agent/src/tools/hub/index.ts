@@ -47,9 +47,9 @@ import {
 } from "./jobs";
 import {
 	executeLaunch,
+	isLaunchToolDetails,
 	type LaunchParams,
 	type LaunchRenderArgs,
-	type LaunchToolDetails,
 	launchRenderCall,
 	launchRenderResult,
 } from "./launch";
@@ -73,7 +73,7 @@ import {
 } from "./types";
 
 export { isWaitingPollDetails } from "./jobs";
-export type { LaunchParams, LaunchToolDetails } from "./launch";
+export { isLaunchToolDetails, type LaunchParams, type LaunchToolDetails } from "./launch";
 export { createIrcMessageCard, isIrcEnabled } from "./messaging";
 export * from "./types";
 
@@ -551,20 +551,6 @@ function isJobStyleArgs(args: HubRenderArgs | undefined): boolean {
 	}
 }
 
-/** Launch details carry process/broker state; coordination details never define these keys. */
-function isLaunchDetails(details: HubDetails): details is LaunchToolDetails {
-	// `state`/`cursor` cover logs results, which may carry neither a daemon
-	// snapshot nor terminal rows; coordination details never define these keys.
-	return (
-		"daemon" in details ||
-		"daemons" in details ||
-		"terminalRows" in details ||
-		"spec" in details ||
-		"state" in details ||
-		"cursor" in details
-	);
-}
-
 /** Hub args → launch renderer args: `ps` is the broker's `list`; everything else is verbatim. */
 function toLaunchArgs(args: HubRenderArgs | undefined): LaunchRenderArgs {
 	if (!args) return {};
@@ -608,7 +594,7 @@ export const hubToolRenderer = {
 		// Results dispatch on what actually happened, falling back to the call
 		// shape when details are absent (framework-generated errors).
 		const details = result.details;
-		if (details && isLaunchDetails(details)) {
+		if (details && isLaunchToolDetails(details)) {
 			return launchRenderResult({ ...result, details }, options, uiTheme, toLaunchArgs(args));
 		}
 		const coordination = details;

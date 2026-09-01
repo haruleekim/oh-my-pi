@@ -321,6 +321,149 @@ describe("AgentSession owner-routed async delivery", () => {
 		expect(JSON.stringify(mock.calls[0]!.context.messages)).toContain("IDLE ACP RESULT");
 	});
 
+	it("persists a UI-cancelled job with exact replay metadata and no unsolicited turn", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			convertToLlm,
+			streamFn: mock.stream,
+		});
+		const authStorage = await AuthStorage.create(":memory:");
+		authStorages.push(authStorage);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const manager = new AsyncJobManager({});
+		AsyncJobManager.setInstance(manager);
+		const sessionManager = SessionManager.inMemory();
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry: new ModelRegistry(authStorage),
+			agentId: "Main",
+			asyncJobManager: manager,
+		});
+		session.setClientBridge({ capabilities: {}, deferAgentInitiatedTurns: true });
+		const stopped = Promise.withResolvers<string>();
+		const jobId = manager.register(
+			"bash",
+			"cancel me",
+			async ({ signal }) => {
+				signal.addEventListener("abort", () => stopped.resolve("stopped"), { once: true });
+				return stopped.promise;
+			},
+			{ id: "cancelled-job", ownerId: "Main" },
+		);
+		const job = manager.getJob(jobId)!;
+
+		expect(manager.cancel(jobId, { ownerId: "Main" })).toBe(true);
+		await session.recordAsyncJobCancellation(job);
+		await manager.waitForAll();
+
+		expect(mock.calls).toHaveLength(0);
+		const persisted = sessionManager
+			.getEntries()
+			.find(entry => entry.type === "custom_message" && entry.customType === "async-result");
+		expect(persisted).toMatchObject({
+			type: "custom_message",
+			customType: "async-result",
+			details: {
+				jobs: [
+					{
+						jobId: "cancelled-job",
+						type: "bash",
+						label: "cancel me",
+						status: "cancelled",
+						startedAt: job.startTime,
+						resultPreview: "",
+					},
+				],
+			},
+		});
+		expect(JSON.stringify(persisted)).toContain("was cancelled");
+
+		await session.prompt("continue");
+		expect(mock.calls).toHaveLength(1);
+		expect(JSON.stringify(mock.calls[0]!.context.messages)).toContain("was cancelled");
+	});
+
+	it("persists idle process completion and Stop without starting an ACP turn", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			convertToLlm,
+			streamFn: mock.stream,
+		});
+		const authStorage = await AuthStorage.create(":memory:");
+		authStorages.push(authStorage);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const sessionManager = SessionManager.inMemory();
+		const owner = sessionManager.getSessionId();
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry: new ModelRegistry(authStorage),
+		});
+		session.setClientBridge({ capabilities: {}, deferAgentInitiatedTurns: true });
+		const completed = {
+			name: "worker",
+			id: "daemon-completed",
+			state: "exited" as const,
+			createdAt: 1,
+			startedAt: 1,
+			exitedAt: 2,
+			exitCode: 0,
+			restartCount: 0,
+			outputBytes: 0,
+			owner,
+			persist: false,
+			detached: false,
+		};
+		const stoppedProcess = {
+			...completed,
+			name: "server",
+			id: "daemon-stopped",
+			exitCode: undefined,
+		};
+
+		await session.queueLaunchCompletion({
+			event: "daemon-completed",
+			completionId: "completion-1",
+			owner,
+			daemon: completed,
+		});
+		await session.recordStoppedLaunchProcess(stoppedProcess);
+
+		expect(mock.calls).toHaveLength(0);
+		const persisted = sessionManager
+			.getEntries()
+			.filter(entry => entry.type === "custom_message" && entry.customType === "launch-completion");
+		expect(persisted).toHaveLength(2);
+		expect(persisted[0]).toMatchObject({
+			details: {
+				daemons: [{ id: "daemon-completed" }],
+				outcomes: { "daemon-completed": "completed" },
+			},
+		});
+		expect(persisted[1]).toMatchObject({
+			details: {
+				daemons: [{ id: "daemon-stopped" }],
+				outcomes: { "daemon-stopped": "stopped" },
+			},
+		});
+		expect(JSON.stringify(persisted[1])).toContain("was stopped");
+
+		await session.prompt("continue");
+		expect(mock.calls).toHaveLength(1);
+		const context = JSON.stringify(mock.calls[0]!.context.messages);
+		expect(context).toContain("worker");
+		expect(context).toContain("server");
+	});
+
 	it("routes an advisor-owned launch completion through the session", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({ handler: () => ({ content: ["Done"] }) });

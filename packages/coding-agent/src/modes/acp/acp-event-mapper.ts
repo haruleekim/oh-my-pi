@@ -537,7 +537,7 @@ function buildToolStartContent(toolName: string, args: unknown): ToolCallContent
 function buildToolStartText(toolName: string, args: unknown): string | undefined {
 	if (isCommandToolName(toolName)) {
 		const command = extractStringProperty<CommandContainer>(args, "command");
-		return command ? limitText(`$ ${command}`) : undefined;
+		return command ? limitAcpText(`$ ${command}`) : undefined;
 	}
 	if (toolName === "eval") {
 		return buildEvalStartText(args);
@@ -571,7 +571,7 @@ function buildEvalStartText(args: unknown): string | undefined {
 		}
 		lines.push(title ? `[${language}] ${title}` : `[${language}]`, code);
 	}
-	return lines.length > 0 ? limitText(lines.join("\n")) : undefined;
+	return lines.length > 0 ? limitAcpText(lines.join("\n")) : undefined;
 }
 
 function mergeToolUpdateContent(startContent: ToolCallContent[], resultContent: ToolCallContent[]): ToolCallContent[] {
@@ -1068,7 +1068,7 @@ function extractStructuredText(value: unknown): string | undefined {
 	if (!text) {
 		return undefined;
 	}
-	return limitText(text);
+	return limitAcpText(text);
 }
 
 function getContentType(value: unknown): string | undefined {
@@ -1106,10 +1106,10 @@ function normalizeText(text: string | undefined): string | undefined {
 		return undefined;
 	}
 	const normalized = text.trim();
-	return normalized.length > 0 ? limitText(normalized) : undefined;
+	return normalized.length > 0 ? limitAcpText(normalized) : undefined;
 }
 
-function limitText(text: string): string {
+export function limitAcpText(text: string): string {
 	return text.length > ACP_TEXT_LIMIT ? `${text.slice(0, ACP_TEXT_LIMIT - 1)}…` : text;
 }
 

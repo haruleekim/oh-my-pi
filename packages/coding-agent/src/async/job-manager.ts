@@ -130,6 +130,8 @@ export interface AsyncJob {
 
 /** Delivery callback for a settled job's result text. */
 export type AsyncJobDeliverySink = (jobId: string, text: string, job?: AsyncJob) => void | Promise<void>;
+/** Observer invoked after one managed job changes lifecycle state or reports output. */
+export type AsyncJobListener = (job: Readonly<AsyncJob>, text?: string) => void;
 
 export interface AsyncJobManagerOptions {
 	/**
@@ -244,6 +246,7 @@ export class AsyncJobManager {
 	readonly #evictionTimers = new Map<string, NodeJS.Timeout>();
 	readonly #pollEscalation = new Map<string | undefined, PollEscalationState>();
 	readonly #deliverySinks = new Map<string, AsyncJobDeliverySink>();
+	readonly #listeners = new Set<{ filter: AsyncJobFilter; listener: AsyncJobListener }>();
 	readonly #onJobComplete: AsyncJobManagerOptions["onJobComplete"];
 	readonly #maxRunningJobs: number;
 	readonly #retentionMs: number;
@@ -261,6 +264,29 @@ export class AsyncJobManager {
 			if (job.ownerId === ownerId) out.push(job);
 		}
 		return out;
+	}
+
+	#notifyJob(job: AsyncJob, text?: string): void {
+		for (const subscription of this.#listeners) {
+			if (subscription.filter.ownerId && subscription.filter.ownerId !== job.ownerId) continue;
+			try {
+				subscription.listener(job, text);
+			} catch (error) {
+				logger.warn("Async job listener failed", {
+					jobId: job.id,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+	}
+
+	/** Observe lifecycle and output updates for jobs matching `filter`. */
+	subscribe(filter: AsyncJobFilter, listener: AsyncJobListener): () => void {
+		const subscription = { filter: { ...filter }, listener };
+		this.#listeners.add(subscription);
+		return () => {
+			this.#listeners.delete(subscription);
+		};
 	}
 
 	constructor(options: AsyncJobManagerOptions) {
@@ -336,6 +362,7 @@ export class AsyncJobManager {
 
 		const reportProgress = async (text: string, details?: AsyncJobDetails): Promise<void> => {
 			if (details) job.latestDetails = details;
+			this.#notifyJob(job, text);
 			if (!options?.onProgress) return;
 			try {
 				await options.onProgress(text, details);
@@ -366,6 +393,7 @@ export class AsyncJobManager {
 				}
 				job.status = "completed";
 				job.resultText = text;
+				this.#notifyJob(job, text);
 				this.#enqueueDelivery(id, text);
 				this.#scheduleEviction(id);
 			} catch (error) {
@@ -378,6 +406,7 @@ export class AsyncJobManager {
 				const errorText = error instanceof Error ? error.message : String(error);
 				job.status = "failed";
 				job.errorText = errorText;
+				this.#notifyJob(job, errorText);
 				this.#enqueueDelivery(id, errorText);
 				this.#scheduleEviction(id);
 			}
@@ -398,6 +427,7 @@ export class AsyncJobManager {
 		if (filter?.ownerId && job.ownerId !== filter.ownerId) return false;
 		if (job.status !== "running") return false;
 		job.status = "cancelled";
+		this.#notifyJob(job);
 		job.abortController.abort();
 		this.#scheduleEviction(id);
 		return true;
@@ -564,6 +594,7 @@ export class AsyncJobManager {
 	#cancelJobs(filter?: AsyncJobFilter, reason?: unknown): void {
 		for (const job of this.getRunningJobs(filter)) {
 			job.status = "cancelled";
+			this.#notifyJob(job);
 			job.abortController.abort(reason);
 			this.#scheduleEviction(job.id);
 		}
@@ -751,6 +782,7 @@ export class AsyncJobManager {
 		this.#consumedJobResults.clear();
 		this.#pollEscalation.clear();
 		this.#deliverySinks.clear();
+		this.#listeners.clear();
 		return jobsSettled && drained;
 	}
 

@@ -68,6 +68,52 @@ describe("launch logs compatibility", () => {
 		expect(request.operation).toMatchObject({ ...operation, renderTerminalRows: true });
 	});
 
+	it("preserves identity-bound log and stop requests", () => {
+		const logs = parseDaemonWireRequest({
+			id: "request-logs",
+			token: "token-1",
+			operation: { ...operation, processId: "daemon-1" },
+		});
+		const stop = parseDaemonWireRequest({
+			id: "request-stop",
+			token: "token-1",
+			operation: { op: "stop", name: "web", processId: "daemon-1", timeoutMs: 5_000 },
+		});
+
+		expect(logs.operation).toMatchObject({ op: "logs", processId: "daemon-1" });
+		expect(stop.operation).toEqual({
+			op: "stop",
+			name: "web",
+			processId: "daemon-1",
+			timeoutMs: 5_000,
+		});
+	});
+
+	it("accepts legacy ping and stop responses while decoding current capabilities", () => {
+		const ping: DaemonOperation = { op: "ping" };
+		expect(parseDaemonRpcResult(ping, { projectDir: "/project" })).toEqual({
+			op: "ping",
+			projectDir: "/project",
+		});
+		expect(
+			parseDaemonRpcResult(ping, {
+				projectDir: "/project",
+				capabilities: { processIdentityCompare: true },
+			}),
+		).toEqual({
+			op: "ping",
+			projectDir: "/project",
+			capabilities: { processIdentityCompare: true },
+		});
+
+		const stop: DaemonOperation = { op: "stop", name: "web", timeoutMs: 5_000 };
+		expect(parseDaemonRpcResult(stop, { daemon: baseSnapshot })).toMatchObject({ op: "stop", stopped: true });
+		expect(parseDaemonRpcResult(stop, { daemon: baseSnapshot, stopped: false })).toMatchObject({
+			op: "stop",
+			stopped: false,
+		});
+	});
+
 	it("preserves completion owner changes on reconnect requests", () => {
 		const request = parseDaemonWireRequest({
 			id: "request-1",

@@ -171,6 +171,19 @@ export interface LaunchToolDetails {
 	spec?: DaemonSpec;
 }
 
+/** Whether tool details carry supervised-process state rather than coordination data. */
+export function isLaunchToolDetails(details: unknown): details is LaunchToolDetails {
+	if (typeof details !== "object" || details === null) return false;
+	return (
+		"daemon" in details ||
+		"daemons" in details ||
+		"terminalRows" in details ||
+		"spec" in details ||
+		"state" in details ||
+		"cursor" in details
+	);
+}
+
 function requiredName(params: LaunchParams): string {
 	if (!params.name) throw new ToolError(`${params.op} requires name`);
 	return params.name;

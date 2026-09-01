@@ -155,7 +155,7 @@ import type { GoalModeState } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
 import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import type { IrcMessage } from "../irc/bus";
-import type { DaemonCompletionNotification } from "../launch/protocol";
+import type { DaemonCompletionNotification, DaemonSnapshot } from "../launch/protocol";
 import { shutdownMnemopiEmbedClient } from "../mnemopi/embed-client";
 import { getMnemopiSessionState, type MnemopiSessionState, setMnemopiSessionState } from "../mnemopi/state";
 import { containsOrchestrate, renderOrchestrateNotice } from "../modes/orchestrate";
@@ -2218,6 +2218,15 @@ export class AgentSession {
 			return;
 		}
 		await this.yieldQueue.enqueueWithReceipt<AsyncResultEntry>("async-result", entry);
+	}
+
+	/** Persist a user-cancelled background job without duplicating manager delivery. */
+	async recordAsyncJobCancellation(job: AsyncJob): Promise<void> {
+		const manager = this.#asyncJobManager;
+		if (!manager || !this.#agentId || job.ownerId !== this.#agentId) {
+			throw new Error("Background job is unavailable for this session");
+		}
+		await this.#deliverAsyncJobResult(manager, job.id, job.resultText ?? job.errorText ?? "", job);
 	}
 
 	async #formatAsyncResultForFollowUp(result: string): Promise<string> {
@@ -6848,10 +6857,38 @@ export class AgentSession {
 	}
 
 	queueLaunchCompletion(notification: DaemonCompletionNotification): Promise<void> {
+		return this.#deliverLaunchCompletion({
+			owner: notification.owner,
+			daemon: notification.daemon,
+			outcome: "completed",
+		});
+	}
+
+	/** Persist an explicit UI Stop using the same launch-completion delivery path. */
+	recordStoppedLaunchProcess(daemon: DaemonSnapshot): Promise<void> {
+		return this.#deliverLaunchCompletion({
+			owner: this.sessionManager.getSessionId(),
+			daemon,
+			outcome: "stopped",
+		});
+	}
+
+	async #deliverLaunchCompletion(entry: LaunchCompletionEntry): Promise<void> {
 		if (this.#isDisposed) return Promise.reject(new Error("Session disposed before launch completion delivery"));
+		if (
+			!this.isStreaming &&
+			this.#clientBridge?.deferAgentInitiatedTurns === true &&
+			!this.#allowAcpAgentInitiatedTurns
+		) {
+			await this.sendCustomMessage(buildLaunchCompletionBatchMessage([entry]), {
+				deliverAs: "nextTurn",
+				triggerTurn: false,
+			});
+			return;
+		}
 		const delivered = this.yieldQueue.enqueueWithReceipt<LaunchCompletionEntry>(
 			LAUNCH_COMPLETION_MESSAGE_TYPE,
-			notification,
+			entry,
 		);
 		this.yieldQueue.requestIdleFlush();
 		return delivered;

@@ -2,13 +2,17 @@ import { afterEach, describe, expect, it, spyOn, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { scheduler } from "node:timers/promises";
 import { AgentBusyError } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
+import { type AsyncJob, AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { resolveLocalUrlToPath } from "@oh-my-pi/pi-coding-agent/internal-urls";
+import type { DaemonBrokerClient } from "@oh-my-pi/pi-coding-agent/launch/client";
+import * as daemonClient from "@oh-my-pi/pi-coding-agent/launch/client";
+import type { DaemonSnapshot } from "@oh-my-pi/pi-coding-agent/launch/protocol";
 import {
 	ACP_BOOTSTRAP_RACE_GUARD_MS,
 	AcpAgent,
@@ -149,6 +153,8 @@ class FakeAgentSession {
 	}
 	promptCalls: string[] = [];
 	customMessages: Array<{ customType: string; content: string; details?: unknown }> = [];
+	cancelledJobs: AsyncJob[] = [];
+	stoppedProcesses: DaemonSnapshot[] = [];
 	customMessageOptions: Array<{ streamingBehavior?: "steer" | "followUp"; queueChipText?: string } | undefined> = [];
 	skillsSettings = { enableSkillCommands: true };
 	skills: Array<{ name: string; description: string; filePath: string; baseDir: string; source: string }> = [];
@@ -368,6 +374,14 @@ class FakeAgentSession {
 
 	getAgentId(): string {
 		return this.agentId;
+	}
+
+	async recordAsyncJobCancellation(job: AsyncJob): Promise<void> {
+		this.cancelledJobs.push(job);
+	}
+
+	async recordStoppedLaunchProcess(daemon: DaemonSnapshot): Promise<void> {
+		this.stoppedProcesses.push(daemon);
 	}
 
 	installSubagentSessionReadyHandler(handler: SubagentSessionReadyHandler | undefined): void {
@@ -1184,6 +1198,217 @@ describe("ACP agent", () => {
 
 		harness.abortController.abort();
 		await Bun.sleep(0);
+	});
+
+	it("advertises target-scoped background controls", async () => {
+		const harness = await createHarness({ clientCapabilities: {} });
+		const response = await harness.agent.initialize({
+			protocolVersion: 1,
+			clientCapabilities: {},
+		});
+
+		expect(response.agentCapabilities?._meta).toEqual({
+			background_job_cancel: true,
+			background_process_stop: true,
+		});
+		await harness.agent.dispose();
+	});
+
+	it("cancels only a root-owned background job and records the cancellation once", async () => {
+		const manager = new AsyncJobManager({});
+		const harness = await createHarness({
+			clientCapabilities: { _meta: { background_job_info: true } },
+			asyncJobManager: manager,
+		});
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		const stopped = Promise.withResolvers<string>();
+		manager.register(
+			"bash",
+			"owned",
+			async ({ signal }) => {
+				signal.addEventListener("abort", () => stopped.resolve("stopped"), { once: true });
+				return stopped.promise;
+			},
+			{ id: "owned-job", ownerId: session.agentId },
+		);
+		manager.register("bash", "other", async () => "private", { id: "other-job", ownerId: "Other" });
+		await expect(
+			harness.agent.extMethod("_omp/jobs/cancel", { sessionId: created.sessionId, jobId: "other-job" }),
+		).rejects.toThrow("Background job is unavailable for this session");
+
+		expect(
+			await harness.agent.extMethod("_omp/jobs/cancel", {
+				sessionId: created.sessionId,
+				jobId: "owned-job",
+			}),
+		).toEqual({ outcome: "cancelled" });
+		await manager.waitForAll();
+		expect(manager.getJob("owned-job")?.status).toBe("cancelled");
+		expect(session.cancelledJobs.map(job => job.id)).toEqual(["owned-job"]);
+		expect(session.abortCalls).toBe(0);
+
+		expect(
+			await harness.agent.extMethod("_omp/jobs/cancel", {
+				sessionId: created.sessionId,
+				jobId: "owned-job",
+			}),
+		).toEqual({ outcome: "already_terminal" });
+		expect(session.cancelledJobs.map(job => job.id)).toEqual(["owned-job"]);
+		await harness.agent.dispose();
+	});
+
+	it("stops only the identity- and owner-matched supervised process", async () => {
+		const harness = await createHarness({ clientCapabilities: { _meta: { background_process_info: true } } });
+
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		let owner = "another-session";
+		const requests: string[] = [];
+		const snapshot: DaemonSnapshot = {
+			name: "web",
+			id: "daemon-1",
+			state: "ready",
+			createdAt: 1,
+			startedAt: 1,
+			readyAt: 2,
+			restartCount: 0,
+			outputBytes: 0,
+			owner: created.sessionId,
+			persist: false,
+			detached: false,
+		};
+		const client = {
+			projectDir: harness.cwdA,
+			onCompletion: () => () => {},
+			request: async operation => {
+				requests.push(operation.op);
+				if (operation.op === "list") return { op: "list", daemons: [{ ...snapshot, owner }] } as const;
+				if (operation.op === "stop") {
+					return {
+						op: "stop",
+						daemon: { ...snapshot, state: "exited" as const, exitedAt: 3 },
+						stopped: true,
+					} as const;
+				}
+				throw new Error(`Unexpected operation ${operation.op}`);
+			},
+			close() {},
+		} satisfies DaemonBrokerClient;
+		vi.spyOn(daemonClient, "daemonClientForProject").mockResolvedValue(client);
+
+		await expect(
+			harness.agent.extMethod("_omp/processes/stop", {
+				sessionId: created.sessionId,
+				name: "web",
+				processId: "daemon-1",
+			}),
+		).rejects.toThrow("Background process is unavailable for this session");
+		owner = created.sessionId;
+		expect(
+			await harness.agent.extMethod("_omp/processes/stop", {
+				sessionId: created.sessionId,
+				name: "web",
+				processId: "daemon-1",
+			}),
+		).toEqual({ outcome: "cancelled" });
+		expect(requests).toEqual(["list", "list", "stop"]);
+		expect(session.stoppedProcesses.map(process => process.id)).toEqual(["daemon-1"]);
+		expect(session.abortCalls).toBe(0);
+		vi.restoreAllMocks();
+		await harness.agent.dispose();
+	});
+	it("keeps the root prompt available while out-of-turn job updates arrive", async () => {
+		vi.useFakeTimers();
+		const manager = new AsyncJobManager({});
+		const harness = await createHarness({
+			clientCapabilities: { _meta: { background_job_info: true } },
+			asyncJobManager: manager,
+		});
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		const progress = Promise.withResolvers<void>();
+		const progressReported = Promise.withResolvers<void>();
+		const finish = Promise.withResolvers<string>();
+		manager.register(
+			"bash",
+			"long build",
+			async ({ reportProgress }) => {
+				await progress.promise;
+				await reportProgress("line 20");
+				progressReported.resolve();
+				return finish.promise;
+			},
+			{ id: "live-job", ownerId: session.agentId },
+		);
+		const ordinaryPrompt = session.prompt.bind(session);
+		let emitBackgroundTool = true;
+		session.prompt = async text => {
+			if (!emitBackgroundTool) return ordinaryPrompt(text);
+			emitBackgroundTool = false;
+			session.promptCalls.push(text);
+			session.isStreaming = true;
+			for (const listener of session.listeners()) {
+				listener({
+					type: "tool_execution_start",
+					toolCallId: "live-tool",
+					toolName: "bash",
+					args: { command: "long build" },
+				});
+				listener({
+					type: "tool_execution_end",
+					toolCallId: "live-tool",
+					toolName: "bash",
+					isError: false,
+					result: {
+						content: [{ type: "text", text: "backgrounded" }],
+						details: { async: { state: "running", jobId: "live-job", type: "bash" } },
+					},
+				});
+			}
+			const assistant = makeAssistantMessage("job started");
+			session.sessionManager.appendMessage(assistant);
+			for (const listener of session.listeners()) {
+				listener({ type: "agent_end", messages: [assistant] });
+			}
+			session.isStreaming = false;
+			return true;
+		};
+
+		await harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "start it" }],
+		});
+		const base = harness.updates.find(
+			notification =>
+				notification.update.sessionUpdate === "tool_call_update" &&
+				notification.update.toolCallId === "live-tool" &&
+				notification.update.status === "completed",
+		);
+		expect(base?.update._meta?.background_job_info).toMatchObject({ status: "running" });
+
+		progress.resolve();
+		await progressReported.promise;
+		vi.advanceTimersByTime(100);
+		for (let pass = 0; pass < 10; pass++) await scheduler.yield();
+		const live = harness.updates.find(
+			notification =>
+				notification.update.sessionUpdate === "tool_call_update" &&
+				notification.update.toolCallId === "live-tool" &&
+				notification.update.rawOutput === "line 20",
+		);
+		expect(live?.update).not.toHaveProperty("status");
+
+		await harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "second prompt" }],
+		});
+		expect(session.promptCalls).toEqual(["start it", "second prompt"]);
+		expect(session.abortCalls).toBe(0);
+
+		finish.resolve("done");
+		await manager.waitForAll();
+		await harness.agent.dispose();
 	});
 
 	it("replays messageIds and returns turn usage for prompts", async () => {

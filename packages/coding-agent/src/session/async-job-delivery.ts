@@ -41,13 +41,16 @@ export interface AsyncResultEntry {
 	epoch: number;
 }
 
-type AsyncResultJobDetails = {
+export type AsyncResultJobDetails = {
 	jobId: string;
 	type?: AsyncJobType;
 	label?: string;
+	status?: AsyncJob["status"];
+	startedAt?: number;
 	durationMs?: number;
 	/** Full structured payload (source/mode/status/data/error), when the job used an output schema. */
 	schema?: StructuredSubagentOutput;
+	resultPreview?: string;
 	details?: Record<string, unknown>;
 };
 
@@ -90,8 +93,12 @@ export function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): Custo
 			result: entry.result,
 			type: entry.job?.type,
 			label: entry.job?.label,
+			status: entry.job?.status,
+			startedAt: entry.job?.startTime,
 			durationMs: entry.durationMs,
+			resultPreview: entry.result.slice(0, ASYNC_PREVIEW_MAX_CHARS),
 			details: entry.job?.latestDetails,
+			cancelled: entry.job?.status === "cancelled",
 			structured,
 			structuredJson,
 			hasStructuredData,
@@ -105,8 +112,11 @@ export function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): Custo
 			jobId: job.jobId,
 			type: job.type,
 			label: job.label,
+			status: job.status,
+			startedAt: job.startedAt,
 			durationMs: job.durationMs,
 			...(job.structured ? { schema: job.structured } : {}),
+			resultPreview: job.resultPreview,
 			details: job.details,
 		})),
 	};

@@ -561,7 +561,11 @@ class DaemonBroker {
 	async #dispatch(operation: DaemonOperation): Promise<DaemonRpcResult> {
 		switch (operation.op) {
 			case "ping":
-				return { op: "ping", projectDir: this.#projectDir };
+				return {
+					op: "ping",
+					projectDir: this.#projectDir,
+					capabilities: { processIdentityCompare: true },
+				};
 			case "start":
 				return this.#start(operation.spec, operation.owner);
 			case "list": {
@@ -578,9 +582,9 @@ class DaemonBroker {
 			case "send":
 				return this.#send(operation);
 			case "stop": {
-				const record = this.#record(operation.name);
-				await this.#stopRecord(record, operation.timeoutMs);
-				return { op: "stop", daemon: record.snapshot };
+				const record = this.#record(operation.name, operation.processId);
+				const stopped = await this.#stopRecord(record, operation.timeoutMs);
+				return { op: "stop", daemon: record.snapshot, stopped };
 			}
 			case "restart":
 				return this.#restart(operation.name);
@@ -1026,7 +1030,7 @@ class DaemonBroker {
 	}
 
 	async #logs(operation: Extract<DaemonOperation, { op: "logs" }>): Promise<DaemonRpcResult> {
-		const record = this.#record(operation.name);
+		const record = this.#record(operation.name, operation.processId);
 		await this.#refreshDetached(record);
 		const cursor = operation.cursor ?? record.snapshot.outputBytes;
 		let timedOut = false;
@@ -1150,9 +1154,9 @@ class DaemonBroker {
 		return { op: "send", daemon: record.snapshot };
 	}
 
-	async #stopRecord(record: ManagedDaemon, timeoutMs: number): Promise<void> {
+	async #stopRecord(record: ManagedDaemon, timeoutMs: number): Promise<boolean> {
 		await this.#refreshDetached(record);
-		if (terminalState(record.snapshot.state)) return;
+		if (terminalState(record.snapshot.state)) return false;
 		record.stopRequested = true;
 		if (record.restartTimer) {
 			clearTimeout(record.restartTimer);
@@ -1162,7 +1166,7 @@ class DaemonBroker {
 			this.#persist(record);
 			await record.log?.close();
 			record.log = undefined;
-			return;
+			return true;
 		}
 		record.snapshot.state = "stopping";
 		this.#persist(record);
@@ -1171,6 +1175,7 @@ class DaemonBroker {
 		else record.pty?.kill();
 		const settled = await this.#waitUntil(record, () => terminalState(record.snapshot.state), timeoutMs + 1_000);
 		if (!settled && record.pty) record.pty.kill();
+		return true;
 	}
 
 	async #restart(name: string): Promise<DaemonRpcResult> {
@@ -1196,9 +1201,14 @@ class DaemonBroker {
 		return condition();
 	}
 
-	#record(name: string): ManagedDaemon {
+	#record(name: string, processId?: string): ManagedDaemon {
 		const record = this.#records.get(name);
-		if (record) return record;
+		if (record) {
+			if (processId !== undefined && processId !== record.snapshot.id) {
+				throw new Error(`Daemon ${name} launch identity changed`);
+			}
+			return record;
+		}
 		const names = [...this.#records.keys()];
 		throw new Error(`Unknown daemon ${name}${names.length ? `. Available: ${names.join(", ")}` : ""}`);
 	}
