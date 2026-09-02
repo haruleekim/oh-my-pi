@@ -288,6 +288,7 @@
 - Fixed top-level errors overwriting the active composer before terminal restoration.
 - Fixed Enter being ignored during the first turn when omp starts with an initial prompt.
 - Fixed ACP tool, assistant, and background-work output being silently clipped to 4,000 characters, including resumed background job results.
+- Fixed ACP plan approval requests omitting plan content after the first 12 lines.
 - Fixed an issue where custom model overrides were lost during configuration updates
 - Fixed "Please use nerdfont" notification incorrectly persisting after theme configuration
 - Fixed sampling parameter errors for newer Anthropic models (Opus 4.7+, Sonnet 5+)

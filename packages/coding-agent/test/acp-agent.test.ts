@@ -879,6 +879,41 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	});
 
+	it("sends the complete plan in a form elicitation request", async () => {
+		let elicitationRequest: CreateElicitationRequest | undefined;
+		const harness = await createHarness({
+			elicitationHandler: async request => {
+				elicitationRequest = request;
+				return { action: "accept", content: { value: "Approve and execute" } };
+			},
+		});
+		Settings.instance.set("plan.enabled", true);
+
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" });
+
+		const localOptions = {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		};
+		cleanupRoots.push(resolveLocalUrlToPath("local://", localOptions));
+		const planContent = [
+			...Array.from({ length: 15 }, (_, index) => `Plan line ${index + 1}`),
+			"FINAL-PLAN-MARKER",
+		].join("\n");
+		await Bun.write(resolveLocalUrlToPath("local://PLAN.md", localOptions), planContent);
+
+		await session.planProposalHandler!("complete-plan");
+
+		expect(elicitationRequest?.mode).toBe("form");
+		expect(elicitationRequest?.message).toBe(
+			`Approve plan "complete-plan" and start implementation?\n\n${planContent}`,
+		);
+
+		harness.abortController.abort();
+	});
+
 	it("plan-proposal handler treats dismissed elicitation as refine, never approves", async () => {
 		// Regression for the P1 review finding on #1870: when a form-capable
 		// ACP client dismissed/cancelled the elicitation, the handler was
