@@ -27,6 +27,7 @@ import { supportsExternalThinking } from "../tools/think";
 import { ToolAbortError, ToolError } from "../tools/tool-errors";
 import { isMountableUnderXdev, listXdevTools, type XdevState, xdevDocsFor, xdevEntries } from "../tools/xdev";
 import { type EditMode, resolveEditMode } from "../utils/edit-mode";
+import { shellSourceToolCallContent } from "./acp-tool-content";
 import {
 	extractPermissionLocations,
 	getPermissionIntent,
@@ -736,9 +737,7 @@ export class SessionTools {
 						target.name === "bash" && args && typeof args === "object" && !Array.isArray(args)
 							? stringProperty(args, "command")
 							: undefined;
-					const commandContent = command
-						? [{ type: "content" as const, content: { type: "text" as const, text: `$ ${command}` } }]
-						: undefined;
+					const commandContent = command ? [shellSourceToolCallContent(toolCallId, command)] : undefined;
 					// Short-circuit on persisted decisions.
 					const persisted = this.#acpPermissionDecisions.get(permissionIntent.cacheKey);
 					if (persisted === "allow_always") {

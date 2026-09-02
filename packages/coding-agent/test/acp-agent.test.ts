@@ -1822,7 +1822,19 @@ describe("ACP agent", () => {
 		);
 		expect(starts[0]).toEqual(
 			expect.objectContaining({
-				content: expect.arrayContaining([{ type: "content", content: { type: "text", text: "$ npm test" } }]),
+				content: expect.arrayContaining([
+					{
+						type: "content",
+						content: {
+							type: "resource",
+							resource: {
+								uri: "omp-shell://tool/toolu_bash_replay/command.sh",
+								text: "npm test",
+								mimeType: "text/x-shellscript",
+							},
+						},
+					},
+				]),
 			}),
 		);
 		expect(starts.some(update => "rawInput" in update && JSON.stringify(update.rawInput) === "{}")).toBe(false);

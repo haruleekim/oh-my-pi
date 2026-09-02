@@ -56,6 +56,20 @@ function expectAcpNotifications(updates: SessionNotification[]): void {
 	}
 }
 
+function shellResourceContent(toolCallId: string, command: string) {
+	return {
+		type: "content" as const,
+		content: {
+			type: "resource" as const,
+			resource: {
+				uri: `omp-shell://tool/${toolCallId}/command.sh`,
+				text: command,
+				mimeType: "text/x-shellscript",
+			},
+		},
+	};
+}
+
 const TEST_MODEL: Model = buildModel({
 	id: "claude-sonnet-4-20250514",
 	name: "Claude Sonnet",
@@ -243,7 +257,7 @@ describe("ACP event mapper", () => {
 			content?: Array<{ type: string; content?: { type: string; text?: string } }>;
 		};
 		expect(update.sessionUpdate).toBe("tool_call");
-		expect(update.content).toContainEqual({ type: "content", content: { type: "text", text: "$ npm run check" } });
+		expect(update.content).toContainEqual(shellResourceContent("tc-command-start", "npm run check"));
 	});
 
 	it("keeps internal Hub traffic off the ACP session stream", () => {
@@ -403,43 +417,68 @@ describe("ACP event mapper", () => {
 			content?: Array<{ type: string; content?: { type: string; text?: string } }>;
 		};
 		expect(update.title).toBe("$ echo hi");
-		expect(update.content).toContainEqual({ type: "content", content: { type: "text", text: "$ echo hi" } });
+		expect(update.content).toContainEqual(shellResourceContent("tc-command-start-generic-intent", "echo hi"));
 	});
 
-	it("preserves eval source when a new eval tool is started", () => {
-		const updates = mapAgentSessionEventToAcpSessionUpdates(
-			{
-				type: "tool_execution_start",
-				toolCallId: "tc-eval-start",
-				toolName: "eval",
-				args: { language: "js", title: "sum", code: "return 1 + 1;" },
-				intent: "sum",
-			} as AgentSessionEvent,
-			"session-1",
-		);
+	it("emits language-tagged resources for eval sources", () => {
+		const cases = [
+			["py", "text/x-python", "py", "print(1)"],
+			["js", "text/javascript", "js", "return 1 + 1;"],
+			["rb", "text/x-ruby", "rb", "puts 1"],
+			["jl", "text/x-julia", "jl", "println(1)"],
+		] as const;
 
-		expect(updates).toHaveLength(1);
-		expectAcpNotifications(updates);
-		const update = updates[0]!.update as {
-			sessionUpdate: string;
-			title: string;
-			kind?: string;
-			status?: string;
-			rawInput?: unknown;
-			content?: Array<{ type: string; content?: { type: string; text?: string } }>;
-		};
-		expect(update.sessionUpdate).toBe("tool_call");
-		expect(update.title).toBe("[js] sum\nreturn 1 + 1;");
-		expect(update.kind).toBe("execute");
-		expect(update.status).toBe("pending");
-		expect(update.rawInput).toEqual({ language: "js", title: "sum", code: "return 1 + 1;" });
-		expect(update.content).toContainEqual({
-			type: "content",
-			content: { type: "text", text: "[js] sum\nreturn 1 + 1;" },
-		});
+		for (const [language, mimeType, extension, source] of cases) {
+			const toolCallId = `tc-eval-${language}`;
+			const args = { language, title: "source", code: source };
+			const updates = mapAgentSessionEventToAcpSessionUpdates(
+				{
+					type: "tool_execution_start",
+					toolCallId,
+					toolName: "eval",
+					args,
+				} as AgentSessionEvent,
+				"session-1",
+			);
+
+			expect(updates).toHaveLength(1);
+			expectAcpNotifications(updates);
+			const update = updates[0]!.update as {
+				sessionUpdate: string;
+				title: string;
+				kind?: string;
+				status?: string;
+				rawInput?: unknown;
+				content?: Array<{
+					type: string;
+					content?: {
+						type: string;
+						resource?: { uri: string; text: string; mimeType?: string };
+					};
+				}>;
+			};
+			expect(update.sessionUpdate).toBe("tool_call");
+			expect(update.title).toBe(`[${language}] source`);
+			expect(update.kind).toBe("execute");
+			expect(update.status).toBe("pending");
+			expect(update.rawInput).toEqual(args);
+			expect(update.content).toEqual([
+				{
+					type: "content",
+					content: {
+						type: "resource",
+						resource: {
+							uri: `omp-eval://tool/${toolCallId}/cell-0.${extension}`,
+							text: source,
+							mimeType,
+						},
+					},
+				},
+			]);
+		}
 	});
 
-	it("builds eval source content from valid cells only", () => {
+	it("builds eval resource content from valid cells only", () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
 				type: "tool_execution_start",
@@ -457,25 +496,56 @@ describe("ACP event mapper", () => {
 		expectAcpNotifications(updates);
 		const update = updates[0]!.update as {
 			title: string;
-			content?: Array<{ type: string; content?: { type: string; text?: string } }>;
+			content?: Array<{
+				type: string;
+				content?: {
+					type: string;
+					resource?: { uri: string; text: string; mimeType?: string };
+				};
+			}>;
 		};
-		expect(update.title).toBe("[?]\nx\n[py]\ny");
-		expect(update.content).toEqual([{ type: "content", content: { type: "text", text: "[?]\nx\n[py]\ny" } }]);
+		expect(update.title).toBe("[?] · [py]");
+		expect(update.content).toEqual([
+			{
+				type: "content",
+				content: {
+					type: "resource",
+					resource: {
+						uri: "omp-eval://tool/tc-eval-mixed-cells/cell-0.txt",
+						text: "x",
+						mimeType: "text/plain",
+					},
+				},
+			},
+			{
+				type: "content",
+				content: {
+					type: "resource",
+					resource: {
+						uri: "omp-eval://tool/tc-eval-mixed-cells/cell-1.py",
+						text: "y",
+						mimeType: "text/x-python",
+					},
+				},
+			},
+		]);
 	});
 
-	it("caps eval titles without truncating visible source content", () => {
-		for (const [sourceLength, titleEndsWithEllipsis] of [
+	it("caps eval titles without truncating resource source", () => {
+		for (const [titleLength, titleEndsWithEllipsis] of [
 			[3_995, false],
 			[3_996, true],
 		] as const) {
-			const source = "x".repeat(sourceLength);
-			const visibleSource = `[js]\n${source}`;
+			const title = "t".repeat(titleLength);
+			const source = `${"x".repeat(4_500)}EVAL-SOURCE-END`;
+			const toolCallId = `tc-eval-long-title-${titleLength}`;
+			const args = { language: "js", title, code: source };
 			const updates = mapAgentSessionEventToAcpSessionUpdates(
 				{
 					type: "tool_execution_start",
-					toolCallId: `tc-eval-long-source-${sourceLength}`,
+					toolCallId,
 					toolName: "eval",
-					args: { language: "js", code: source },
+					args,
 				} as AgentSessionEvent,
 				"session-1",
 			);
@@ -484,35 +554,71 @@ describe("ACP event mapper", () => {
 			expectAcpNotifications(updates);
 			const update = updates[0]!.update as {
 				title: string;
-				content?: Array<{ type: string; content?: { type: string; text?: string } }>;
+				content?: Array<{
+					type: string;
+					content?: {
+						type: string;
+						resource?: { uri: string; text: string; mimeType?: string };
+					};
+				}>;
 				rawInput?: unknown;
 			};
 			expect(update.title).toHaveLength(4_000);
 			expect(update.title.endsWith("…")).toBe(titleEndsWithEllipsis);
-			expect(update.content).toEqual([{ type: "content", content: { type: "text", text: visibleSource } }]);
-			expect(update.rawInput).toEqual({ language: "js", code: source });
+			expect(update.content).toEqual([
+				{
+					type: "content",
+					content: {
+						type: "resource",
+						resource: {
+							uri: `omp-eval://tool/${toolCallId}/cell-0.js`,
+							text: source,
+							mimeType: "text/javascript",
+						},
+					},
+				},
+			]);
+			expect(update.rawInput).toEqual(args);
 		}
 	});
 
-	it("caps command titles at the boundary without truncating command content", () => {
+	it("caps command titles without truncating shell resource source", () => {
 		for (const [commandLength, titleEndsWithEllipsis] of [
 			[3_998, false],
 			[3_999, true],
 		] as const) {
 			const command = "c".repeat(commandLength);
-			const visibleCommand = `$ ${command}`;
+			const toolCallId = `tc-command-title-${commandLength}`;
 			const update = buildToolCallStartUpdate({
-				toolCallId: `tc-command-title-${commandLength}`,
+				toolCallId,
 				toolName: "bash",
 				args: { command },
 			}) as {
 				title: string;
-				content?: Array<{ type: string; content?: { type: string; text?: string } }>;
+				content?: Array<{
+					type: string;
+					content?: {
+						type: string;
+						resource?: { uri: string; text: string; mimeType?: string };
+					};
+				}>;
 			};
 
 			expect(update.title).toHaveLength(4_000);
 			expect(update.title.endsWith("…")).toBe(titleEndsWithEllipsis);
-			expect(update.content).toEqual([{ type: "content", content: { type: "text", text: visibleCommand } }]);
+			expect(update.content).toEqual([
+				{
+					type: "content",
+					content: {
+						type: "resource",
+						resource: {
+							uri: `omp-shell://tool/${toolCallId}/command.sh`,
+							text: command,
+							mimeType: "text/x-shellscript",
+						},
+					},
+				},
+			]);
 		}
 	});
 
@@ -673,7 +779,7 @@ describe("ACP event mapper", () => {
 			content?: Array<{ type: string; terminalId?: string; content?: { type: string; text?: string } }>;
 		};
 		expect(update.sessionUpdate).toBe("tool_call_update");
-		expect(update.content).toContainEqual({ type: "content", content: { type: "text", text: "$ npm run check" } });
+		expect(update.content).toContainEqual(shellResourceContent("tc-3", "npm run check"));
 		expect(update.content).toContainEqual({ type: "terminal", terminalId: "term-1" });
 		expect(update.content).not.toContainEqual({
 			type: "content",
@@ -700,7 +806,7 @@ describe("ACP event mapper", () => {
 			content?: Array<{ type: string; terminalId?: string; content?: { type: string; text?: string } }>;
 		};
 		expect(update.sessionUpdate).toBe("tool_call_update");
-		expect(update.content).toContainEqual({ type: "content", content: { type: "text", text: "$ echo hi" } });
+		expect(update.content).toContainEqual(shellResourceContent("tc-terminal-empty-content", "echo hi"));
 		expect(update.content).toContainEqual({ type: "terminal", terminalId: "term-1" });
 		expect(update.content).not.toContainEqual({
 			type: "content",
@@ -823,7 +929,7 @@ describe("ACP event mapper", () => {
 			content?: Array<{ type: string; terminalId?: string; content?: { type: string; text?: string } }>;
 		};
 		expect(update.sessionUpdate).toBe("tool_call_update");
-		expect(update.content).toContainEqual({ type: "content", content: { type: "text", text: "$ npm run check" } });
+		expect(update.content).toContainEqual(shellResourceContent("tc-terminal-final-command", "npm run check"));
 		expect(update.content).toContainEqual({ type: "content", content: { type: "text", text: "done" } });
 		expect(update.content).toContainEqual({ type: "terminal", terminalId: "term-1" });
 	});
@@ -997,7 +1103,7 @@ describe("ACP event mapper", () => {
 		expect(update.kind).toBe("execute");
 		expect(update.status).toBe("pending");
 		expect(update.rawInput).toEqual({ command: "npm run check", cwd: "/repo" });
-		expect(update.content).toEqual([{ type: "content", content: { type: "text", text: "$ npm run check" } }]);
+		expect(update.content).toEqual([shellResourceContent("toolu_bash_1", "npm run check")]);
 	});
 
 	it("maps shell and exec tool starts as execute", () => {
@@ -1016,12 +1122,14 @@ describe("ACP event mapper", () => {
 			expectAcpNotifications(updates);
 			const update = updates[0]!.update as {
 				sessionUpdate: string;
+				title?: string;
 				kind?: string;
 				content?: unknown;
 			};
 			expect(update.sessionUpdate).toBe("tool_call");
+			expect(update.title).toBe("$ echo hi");
 			expect(update.kind).toBe("execute");
-			expect(update.content).toEqual([{ type: "content", content: { type: "text", text: "$ echo hi" } }]);
+			expect(update.content).toEqual([shellResourceContent(`toolu_${toolName}_1`, "echo hi")]);
 		}
 	});
 
@@ -1100,8 +1208,8 @@ describe("ACP event mapper", () => {
 
 			expect(toolCall?.rawInput).toEqual({ command: "echo hi" });
 			expect(toolCall?.rawInput).not.toEqual({ input: { command: "echo hi" } });
-			expect(toolCall?.content).toEqual([{ type: "content", content: { type: "text", text: "$ echo hi" } }]);
-			expect(finalUpdate?.content).toContainEqual({ type: "content", content: { type: "text", text: "$ echo hi" } });
+			expect(toolCall?.content).toEqual([shellResourceContent("toolu_replay_input", "echo hi")]);
+			expect(finalUpdate?.content).toContainEqual(shellResourceContent("toolu_replay_input", "echo hi"));
 			expect(finalUpdate?.content).toContainEqual({ type: "content", content: { type: "text", text: "done" } });
 			expect(finalUpdate?.content).toContainEqual({ type: "terminal", terminalId: "term-replay" });
 		} finally {
@@ -1126,7 +1234,7 @@ describe("ACP event mapper", () => {
 			kind: "execute",
 			status: "completed",
 			rawInput: { command: "npm test", cwd: "/repo" },
-			content: [{ type: "content", content: { type: "text", text: "$ npm test" } }],
+			content: [shellResourceContent("toolu_replay_1", "npm test")],
 		});
 	});
 
@@ -1196,7 +1304,7 @@ describe("ACP event mapper", () => {
 			title: "$ bun test",
 			status: "completed",
 			rawInput: rawArgs,
-			content: [{ type: "content", content: { type: "text", text: "$ bun test" } }],
+			content: [shellResourceContent("toolu_replay_object", "bun test")],
 		});
 	});
 	it("does not add command text content to non-command tool starts", () => {

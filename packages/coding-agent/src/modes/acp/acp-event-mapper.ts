@@ -10,7 +10,8 @@ import type {
 } from "@oh-my-pi/pi-utils/acp";
 import { parseXdUrl } from "../../internal-urls/xd-protocol";
 import type { AgentSessionEvent } from "../../session/agent-session";
-import { resolveToCwd, splitPathAndSelPreferringLiteralSync } from "../../tools/path-utils";
+import { shellSourceToolCallContent } from "../../session/acp-tool-content";
+import { resolveToCwd, splitPathAndSel, splitPathAndSelPreferringLiteralSync } from "../../tools/path-utils";
 import type { TodoStatus } from "../../tools/todo";
 import { canonicalizeMessage } from "../../utils/thinking-display";
 
@@ -86,6 +87,12 @@ interface EvalCellLike {
 	language?: unknown;
 	title?: unknown;
 	code?: unknown;
+}
+
+interface EvalSourceCell {
+	language: string;
+	title?: string;
+	code: string;
 }
 
 interface PatternContainer {
@@ -238,7 +245,7 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 		case "tool_execution_update": {
 			if (isInternalHubMessageTool(event.toolName, event.args)) return [];
 			const content = mergeToolUpdateContent(
-				buildToolStartContent(event.toolName, event.args),
+				buildToolStartContent(event.toolCallId, event.toolName, event.args),
 				extractToolCallContent(event.partialResult, options),
 			);
 			const update: SessionUpdate = {
@@ -263,7 +270,10 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 				...extractDiffToolCallContent(event.result),
 				...extractToolCallContent(event.result, options),
 			];
-			const content = mergeToolUpdateContent(buildToolStartContent(event.toolName, args), resultContent);
+			const content = mergeToolUpdateContent(
+				buildToolStartContent(event.toolCallId, event.toolName, args),
+				resultContent,
+			);
 			const update: SessionUpdate = {
 				sessionUpdate: "tool_call_update",
 				toolCallId: event.toolCallId,
@@ -497,7 +507,7 @@ export function buildToolCallStartUpdate(input: {
 		status: input.status ?? "pending",
 		rawInput: input.args,
 	};
-	const content = buildToolStartContent(input.toolName, input.args);
+	const content = buildToolStartContent(input.toolCallId, input.toolName, input.args);
 	if (content.length > 0) {
 		update.content = content;
 	}
@@ -530,49 +540,90 @@ function getToolExecutionEndArgs(
 	return options.getToolArgs?.(event.toolCallId);
 }
 
-function buildToolStartContent(toolName: string, args: unknown): ToolCallContent[] {
-	const text = buildToolStartText(toolName, args);
-	return text ? [textToolCallContent(text)] : [];
-}
-
-function buildToolStartText(toolName: string, args: unknown): string | undefined {
+function buildToolStartContent(toolCallId: string, toolName: string, args: unknown): ToolCallContent[] {
 	if (isCommandToolName(toolName)) {
-		const command = extractStringProperty<CommandContainer>(args, "command");
-		return command ? `$ ${command}` : undefined;
+		return buildCommandStartContent(toolCallId, args);
 	}
 	if (toolName === "eval") {
-		return buildEvalStartText(args);
+		return buildEvalStartContent(toolCallId, args);
 	}
-	return undefined;
+	return [];
 }
 
-function buildEvalStartText(args: unknown): string | undefined {
+function buildCommandTitle(args: unknown): string | undefined {
+	const command = extractStringProperty<CommandContainer>(args, "command");
+	return command ? `$ ${command}` : undefined;
+}
+
+function buildCommandStartContent(toolCallId: string, args: unknown): ToolCallContent[] {
+	const command = extractStringProperty<CommandContainer>(args, "command");
+	return command ? [shellSourceToolCallContent(toolCallId, command)] : [];
+}
+
+function extractEvalCells(args: unknown): EvalSourceCell[] {
 	if (typeof args !== "object" || args === null || Array.isArray(args)) {
-		return undefined;
+		return [];
 	}
 	const container = args as EvalCellContainer & EvalCellLike;
-	const cells = Array.isArray(container.cells)
+	const candidates = Array.isArray(container.cells)
 		? container.cells
 		: typeof container.code === "string"
 			? [container]
 			: [];
-	if (cells.length === 0) {
-		return undefined;
-	}
-	const lines: string[] = [];
-	for (const cell of cells) {
-		if (typeof cell !== "object" || cell === null || Array.isArray(cell)) {
+	const cells: EvalSourceCell[] = [];
+	for (const candidate of candidates) {
+		if (typeof candidate !== "object" || candidate === null || Array.isArray(candidate)) {
 			continue;
 		}
-		const language = extractStringProperty<EvalCellLike>(cell, "language") ?? "?";
-		const title = extractStringProperty<EvalCellLike>(cell, "title");
-		const code = extractStringProperty<EvalCellLike>(cell, "code");
+		const code = extractStringProperty<EvalCellLike>(candidate, "code");
 		if (!code) {
 			continue;
 		}
-		lines.push(title ? `[${language}] ${title}` : `[${language}]`, code);
+		const language = extractStringProperty<EvalCellLike>(candidate, "language") ?? "?";
+		const title = extractStringProperty<EvalCellLike>(candidate, "title");
+		cells.push(title ? { language, title, code } : { language, code });
 	}
-	return lines.length > 0 ? lines.join("\n") : undefined;
+	return cells;
+}
+
+function buildEvalTitle(args: unknown): string | undefined {
+	const cells = extractEvalCells(args);
+	if (cells.length === 0) {
+		return undefined;
+	}
+	return cells.map(cell => (cell.title ? `[${cell.language}] ${cell.title}` : `[${cell.language}]`)).join(" · ");
+}
+
+function buildEvalStartContent(toolCallId: string, args: unknown): ToolCallContent[] {
+	return extractEvalCells(args).map((cell, index) => {
+		const { mimeType, extension } = evalResourceMetadata(cell.language);
+		return {
+			type: "content",
+			content: {
+				type: "resource",
+				resource: {
+					uri: `omp-eval://tool/${encodeURIComponent(toolCallId)}/cell-${index}.${extension}`,
+					text: cell.code,
+					mimeType,
+				},
+			},
+		};
+	});
+}
+
+function evalResourceMetadata(language: string): { mimeType: string; extension: string } {
+	switch (language) {
+		case "py":
+			return { mimeType: "text/x-python", extension: "py" };
+		case "js":
+			return { mimeType: "text/javascript", extension: "js" };
+		case "rb":
+			return { mimeType: "text/x-ruby", extension: "rb" };
+		case "jl":
+			return { mimeType: "text/x-julia", extension: "jl" };
+		default:
+			return { mimeType: "text/plain", extension: "txt" };
+	}
 }
 
 function mergeToolUpdateContent(startContent: ToolCallContent[], resultContent: ToolCallContent[]): ToolCallContent[] {
@@ -600,9 +651,9 @@ function isCommandToolName(toolName: string): boolean {
 function buildToolTitle(toolName: string, args: unknown, intent: string | undefined): string {
 	let title: string | undefined;
 	if (isCommandToolName(toolName)) {
-		title = buildToolStartText(toolName, args);
+		title = buildCommandTitle(args);
 	} else if (toolName === "eval") {
-		title = buildEvalStartText(args);
+		title = buildEvalTitle(args);
 	}
 	title ??= intent?.trim() || undefined;
 

@@ -21,6 +21,9 @@
 ### Changed
 
 - Agent delegation is now model-aware, allowing some models to favor focused inline work instead of spawning subagents.
+### Changed
+
+- Eval and shell source sent to ACP clients now carries language metadata, enabling syntax highlighting in supporting editors.
 
 ### Fixed
 

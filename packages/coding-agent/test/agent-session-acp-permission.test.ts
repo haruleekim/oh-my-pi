@@ -700,7 +700,19 @@ it("bash permission requests include execute metadata and command content", asyn
 		kind: "execute",
 		status: "pending",
 		rawInput: { command: "git status --short" },
-		content: [{ type: "content", content: { type: "text", text: "$ git status --short" } }],
+		content: [
+			{
+				type: "content",
+				content: {
+					type: "resource",
+					resource: {
+						uri: "omp-shell://tool/call-bash-rich/command.sh",
+						text: "git status --short",
+						mimeType: "text/x-shellscript",
+					},
+				},
+			},
+		],
 	});
 	expect(bashTool.executeCalls).toBe(1);
 });
