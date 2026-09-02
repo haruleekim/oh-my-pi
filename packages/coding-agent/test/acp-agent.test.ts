@@ -3105,7 +3105,10 @@ describe("ACP agent", () => {
 			expect(calls).toHaveLength(1);
 			const request = calls[0]!;
 			if (!isFormElicitation(request)) throw new Error("expected form-mode elicitation");
-			expect(request.message).toBe("Which approach?");
+			expect(
+				[request.message, request.requestedSchema.properties.q0?.title].filter(text => text === "Which approach?"),
+			).toHaveLength(1);
+			expect(request.message).toBe("Answer 1 question");
 			expect(request.requestedSchema.required).toBeUndefined();
 			expect(request.requestedSchema.properties.q0).toEqual({
 				type: "string",
@@ -3217,7 +3220,11 @@ describe("ACP agent", () => {
 			expect(calls).toHaveLength(1);
 			const request = calls[0]!;
 			if (!isFormElicitation(request)) throw new Error("expected form-mode elicitation");
-			expect(Object.keys(request.requestedSchema.properties)).toEqual(["q0__other", "q1__other"]);
+			expect(request.message).toBe("Answer 2 questions");
+			expect(request.requestedSchema.properties).toEqual({
+				q0__other: { type: "string", title: "Single?" },
+				q1__other: { type: "string", title: "Multi?" },
+			});
 			expect(result?.kind === "submit" ? result.results : undefined).toMatchObject([
 				{ id: "single", selectedOptions: [], customInput: "single answer" },
 				{ id: "multi", selectedOptions: [], customInput: "multi answer" },

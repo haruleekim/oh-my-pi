@@ -530,7 +530,11 @@ export function createAcpExtensionUiContext(
 						};
 					}
 				}
-				properties[`${key}__other`] = { type: "string", title: OTHER_OPTION };
+				properties[`${key}__other`] = {
+					type: "string",
+					title: entries.length === 0 ? question.question : OTHER_OPTION,
+					...(entries.length === 0 && description ? { description } : {}),
+				};
 			}
 
 			let timedOut = false;
@@ -538,7 +542,7 @@ export function createAcpExtensionUiContext(
 				connection,
 				getSessionId(),
 				"askDialog",
-				questions.length === 1 ? questions[0].question : `Answer ${questions.length} questions`,
+				questions.length === 1 ? "Answer 1 question" : `Answer ${questions.length} questions`,
 				properties,
 				undefined,
 				{
