@@ -101,6 +101,8 @@ interface PlanHarness {
 	isPendingFullWriteDescription: () => boolean;
 }
 
+const PLAN_PROPOSAL_CONTEXT = { toolCallId: "plan-mode-test" };
+
 describe("AgentSession plan-mode convergence", () => {
 	let tempDir: TempDir;
 	let session: AgentSession | undefined;
@@ -441,7 +443,7 @@ describe("AgentSession plan-mode convergence", () => {
 		await Bun.write(planPath, "# Demo plan\n\nImplement it.\n");
 		const handler = harness.session.peekPlanProposalHandler();
 		expect(handler).toBeDefined();
-		await handler!("demo");
+		await handler!("demo", PLAN_PROPOSAL_CONTEXT);
 
 		expect(harness.session.getPlanModeState()).toBeUndefined();
 		expect(harness.session.getActiveToolNames()).toEqual(["read"]);
@@ -472,7 +474,7 @@ describe("AgentSession plan-mode convergence", () => {
 		await Bun.write(planPath, "# MCP devices plan\n\nKeep the connected devices.\n");
 		const handler = harness.session.peekPlanProposalHandler();
 		if (!handler) throw new Error("Expected PlanYolo proposal handler");
-		await handler("mcp-devices");
+		await handler("mcp-devices", PLAN_PROPOSAL_CONTEXT);
 
 		expect(harness.session.getPlanModeState()).toBeUndefined();
 		expect(harness.session.getActiveToolNames()).toEqual(["read", "write", "mcp__context_query_docs"]);
@@ -508,7 +510,7 @@ describe("AgentSession plan-mode convergence", () => {
 		await Bun.write(planPath, "# Queued MCP plan\n\nKeep the connected device.\n");
 		const handler = harness.session.peekPlanProposalHandler();
 		if (!handler) throw new Error("Expected PlanYolo proposal handler");
-		const approval = handler("queued-mcp");
+		const approval = handler("queued-mcp", PLAN_PROPOSAL_CONTEXT);
 		release.resolve();
 		await Promise.all([blocker, refresh, approval]);
 
@@ -539,7 +541,7 @@ describe("AgentSession plan-mode convergence", () => {
 		await Bun.write(planPath, "# Read-only MCP plan\n\nKeep the selected device.\n");
 		const handler = harness.session.peekPlanProposalHandler();
 		if (!handler) throw new Error("Expected PlanYolo proposal handler");
-		await handler("read-only-mcp");
+		await handler("read-only-mcp", PLAN_PROPOSAL_CONTEXT);
 
 		expect(harness.session.getPlanModeState()).toBeUndefined();
 		expect(harness.session.getActiveToolNames()).toEqual(["read", "mcp__chrome_devtools_list_pages"]);
@@ -565,13 +567,13 @@ describe("AgentSession plan-mode convergence", () => {
 		const mountedBefore = harness.session.getMountedXdevToolNames();
 		rebuildGate.fail = true;
 
-		await expect(handler!("retry")).rejects.toThrow("rebuild failed");
+		await expect(handler!("retry", PLAN_PROPOSAL_CONTEXT)).rejects.toThrow("rebuild failed");
 		expect(harness.session.getPlanModeState()?.enabled).toBe(true);
 		expect(harness.session.peekPlanProposalHandler()).toBe(handler);
 		expect(harness.session.getActiveToolNames()).toEqual(activeBefore);
 		expect(harness.session.getMountedXdevToolNames()).toEqual(mountedBefore);
 		rebuildGate.fail = false;
-		await handler!("retry");
+		await handler!("retry", PLAN_PROPOSAL_CONTEXT);
 		expect(harness.session.getPlanModeState()).toBeUndefined();
 		expect(harness.session.getActiveToolNames()).toEqual(["read"]);
 	});

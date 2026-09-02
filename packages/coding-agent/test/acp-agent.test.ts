@@ -33,6 +33,7 @@ import { DEFAULT_STT_MODEL_KEY, STT_MODEL_OPTIONS } from "@oh-my-pi/pi-coding-ag
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import { type SubagentLifecyclePayload, TASK_SUBAGENT_LIFECYCLE_CHANNEL } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import type { PlanProposalHandler } from "@oh-my-pi/pi-coding-agent/tools/resolve";
 import {
 	DEFAULT_TTS_LOCAL_MODEL_KEY,
 	DEFAULT_TTS_VOICE,
@@ -48,6 +49,7 @@ import type {
 	CreateElicitationResponse,
 	PromptRequest,
 	RequestPermissionRequest,
+	RequestPermissionResponse,
 	SessionNotification,
 	Validator,
 } from "@oh-my-pi/pi-utils/acp";
@@ -404,13 +406,13 @@ class FakeAgentSession {
 		this.planModeState = state;
 	}
 
-	planProposalHandler: ((title: string) => Promise<unknown> | unknown) | undefined;
+	planProposalHandler: PlanProposalHandler | undefined;
 
-	setPlanProposalHandler(handler: ((title: string) => Promise<unknown> | unknown) | null): void {
+	setPlanProposalHandler(handler: PlanProposalHandler | null): void {
 		this.planProposalHandler = handler ?? undefined;
 	}
 
-	peekPlanProposalHandler(): ((title: string) => Promise<unknown> | unknown) | undefined {
+	peekPlanProposalHandler(): PlanProposalHandler | undefined {
 		return this.planProposalHandler;
 	}
 
@@ -499,6 +501,7 @@ interface AgentHarness {
 	setToolUIContextSpies: SetToolUIContextSpy[];
 	subagentEventBuses: EventBus[];
 	permissionSessionIds: string[];
+	permissionRequests: RequestPermissionRequest[];
 	sessionFactoryOptions: Array<{ interactivePrompts?: boolean } | undefined>;
 	cwdA: string;
 	cwdB: string;
@@ -538,6 +541,7 @@ afterEach(async () => {
 async function createHarness(
 	options: {
 		elicitationHandler?: (req: CreateElicitationRequest) => Promise<CreateElicitationResponse>;
+		permissionHandler?: (request: RequestPermissionRequest) => Promise<RequestPermissionResponse>;
 		clientCapabilities?: ClientCapabilities;
 		/** Runs before a notification is recorded, so a test can delay one delivery. */
 		sessionUpdateHook?: (notification: SessionNotification) => Promise<void> | void;
@@ -561,6 +565,7 @@ async function createHarness(
 	const setToolUIContextSpies: SetToolUIContextSpy[] = [];
 	const subagentEventBuses: EventBus[] = [];
 	const permissionSessionIds: string[] = [];
+	const permissionRequests: RequestPermissionRequest[] = [];
 	const sessionFactoryOptions: Array<{ interactivePrompts?: boolean } | undefined> = [];
 	const connection = {
 		sessionUpdate: async (notification: SessionNotification) => {
@@ -576,7 +581,8 @@ async function createHarness(
 		closed: Promise.withResolvers<void>().promise,
 		requestPermission: async (request: RequestPermissionRequest) => {
 			permissionSessionIds.push(request.sessionId);
-			return { outcome: { outcome: "cancelled" as const } };
+			permissionRequests.push(request);
+			return options.permissionHandler?.(request) ?? { outcome: { outcome: "cancelled" as const } };
 		},
 	} as unknown as AgentSideConnection;
 
@@ -611,6 +617,7 @@ async function createHarness(
 		setToolUIContextSpies,
 		subagentEventBuses,
 		permissionSessionIds,
+		permissionRequests,
 		sessionFactoryOptions,
 		cwdA,
 		cwdB,
@@ -622,6 +629,51 @@ async function createHarness(
 async function advanceBootstrapGuard(): Promise<void> {
 	vi.advanceTimersByTime(ACP_BOOTSTRAP_RACE_GUARD_MS);
 	await Promise.resolve();
+}
+
+interface PlanApprovalHarness {
+	harness: AgentHarness;
+	session: FakeAgentSession;
+	handler: PlanProposalHandler;
+	updatesBefore: number;
+}
+
+async function createPlanApprovalHarness(
+	permissionHandler: (request: RequestPermissionRequest) => Promise<RequestPermissionResponse>,
+	clientCapabilities?: ClientCapabilities,
+): Promise<PlanApprovalHarness> {
+	const harness = await createHarness({
+		permissionHandler,
+		...(clientCapabilities ? { clientCapabilities } : {}),
+	});
+	Settings.instance.set("plan.enabled", true);
+	const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+	const session = harness.findSession(created.sessionId)!;
+	await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" });
+	const localOptions = {
+		getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+		getSessionId: () => session.sessionManager.getSessionId(),
+	};
+	cleanupRoots.push(resolveLocalUrlToPath("local://", localOptions));
+	await Bun.write(resolveLocalUrlToPath("local://PLAN.md", localOptions), "# Safety plan\n\nKeep plan mode active.");
+	const handler = session.planProposalHandler;
+	if (!handler) throw new Error("Expected plan proposal handler");
+	return { harness, session, handler, updatesBefore: harness.updates.length };
+}
+
+function expectPlanApprovalPending({ harness, session, updatesBefore }: PlanApprovalHarness): void {
+	expect(session.planModeState?.enabled).toBe(true);
+	expect(typeof session.planProposalHandler).toBe("function");
+	expect(session.planReferencePath).toBeUndefined();
+	expect(
+		harness.updates
+			.slice(updatesBefore)
+			.some(
+				notification =>
+					notification.update.sessionUpdate === "current_mode_update" &&
+					notification.update.currentModeId === "default",
+			),
+	).toBe(false);
 }
 
 describe("ACP agent", () => {
@@ -809,7 +861,7 @@ describe("ACP agent", () => {
 
 		// No plan file written → handler surfaces a ToolError telling the
 		// agent to write the plan before requesting approval.
-		await expect(handler!("demo")).rejects.toThrow(/Plan file not found/);
+		await expect(handler!("demo", { toolCallId: "tc-missing-plan" })).rejects.toThrow(/Plan file not found/);
 		// Plan mode must remain active so the agent can recover.
 		expect(session.planModeState?.enabled).toBe(true);
 		expect(typeof session.planProposalHandler).toBe("function");
@@ -819,7 +871,9 @@ describe("ACP agent", () => {
 	});
 
 	it("plan-proposal handler approves the agent-named plan and exits plan mode on submit", async () => {
-		const harness = await createHarness();
+		const harness = await createHarness({
+			permissionHandler: async () => ({ outcome: { outcome: "selected", optionId: "approve" } }),
+		});
 		Settings.instance.set("plan.enabled", true);
 
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
@@ -838,7 +892,7 @@ describe("ACP agent", () => {
 
 		const updatesBefore = harness.updates.length;
 		const handler = session.planProposalHandler!;
-		const result = (await handler("words-counter")) as {
+		const result = (await handler("words-counter", { toolCallId: "tc-approve-plan" })) as {
 			content: Array<{ type: string; text: string }>;
 			details: { planFilePath: string; title: string; planExists: boolean };
 		};
@@ -879,13 +933,14 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	});
 
-	it("sends the complete plan in a form elicitation request", async () => {
-		let elicitationRequest: CreateElicitationRequest | undefined;
+	it("sends the complete plan as Markdown on the existing permission card", async () => {
+		let elicitationCalls = 0;
 		const harness = await createHarness({
-			elicitationHandler: async request => {
-				elicitationRequest = request;
-				return { action: "accept", content: { value: "Approve and execute" } };
+			elicitationHandler: async () => {
+				elicitationCalls++;
+				return { action: "cancel" };
 			},
+			permissionHandler: async () => ({ outcome: { outcome: "selected", optionId: "approve" } }),
 		});
 		Settings.instance.set("plan.enabled", true);
 
@@ -899,30 +954,49 @@ describe("ACP agent", () => {
 		};
 		cleanupRoots.push(resolveLocalUrlToPath("local://", localOptions));
 		const planContent = [
+			"# Complete plan",
+			"",
 			...Array.from({ length: 15 }, (_, index) => `Plan line ${index + 1}`),
 			"FINAL-PLAN-MARKER",
 		].join("\n");
 		await Bun.write(resolveLocalUrlToPath("local://PLAN.md", localOptions), planContent);
 
-		await session.planProposalHandler!("complete-plan");
+		await session.planProposalHandler!("complete-plan", { toolCallId: "tc-complete-plan" });
 
-		expect(elicitationRequest?.mode).toBe("form");
-		expect(elicitationRequest?.message).toBe(
-			`Approve plan "complete-plan" and start implementation?\n\n${planContent}`,
-		);
+		expect(elicitationCalls).toBe(0);
+		expect(harness.permissionRequests).toHaveLength(1);
+		const request = harness.permissionRequests[0]!;
+		expect(request.sessionId).toBe(created.sessionId);
+		expect(request.toolCall).toEqual({
+			toolCallId: "tc-complete-plan",
+			title: "Review plan: Complete plan",
+			kind: "switch_mode",
+			status: "pending",
+			content: [
+				{
+					type: "content",
+					content: {
+						type: "resource",
+						resource: {
+							uri: "omp-plan://tool/tc-complete-plan/plan.md",
+							text: planContent,
+							mimeType: "text/markdown",
+						},
+					},
+				},
+			],
+		});
+		expect(request.options).toEqual([
+			{ optionId: "approve", name: "Approve and execute", kind: "allow_once" },
+			{ optionId: "refine", name: "Refine plan", kind: "reject_once" },
+		]);
 
 		harness.abortController.abort();
 	});
 
-	it("plan-proposal handler treats dismissed elicitation as refine, never approves", async () => {
-		// Regression for the P1 review finding on #1870: when a form-capable
-		// ACP client dismissed/cancelled the elicitation, the handler was
-		// returning the dismissal as approval — silently granting write
-		// access without explicit consent. Dismissal MUST fall through to
-		// refine semantics: plan mode stays active, the plan file stays put,
-		// and no mode/config updates are emitted.
+	it("plan-proposal handler treats cancelled permission as refine, never approves", async () => {
 		const harness = await createHarness({
-			elicitationHandler: async () => ({ action: "cancel" }),
+			permissionHandler: async () => ({ outcome: { outcome: "cancelled" } }),
 		});
 		Settings.instance.set("plan.enabled", true);
 
@@ -940,17 +1014,15 @@ describe("ACP agent", () => {
 
 		const updatesBefore = harness.updates.length;
 		const handler = session.planProposalHandler!;
-		const result = (await handler("words-counter")) as { content: Array<{ type: string; text: string }> };
+		const result = (await handler("words-counter", { toolCallId: "tc-cancel-plan" })) as {
+			content: Array<{ type: string; text: string }>;
+		};
 
 		expect(result.content[0]?.text).toMatch(/refinement requested/i);
-		// Plan file stays put; no rename, no write-access grant.
 		expect(await Bun.file(planPath).exists()).toBe(true);
-		expect(await Bun.file(resolveLocalUrlToPath("local://words-counter.md", localOptions)).exists()).toBe(false);
-		// Plan mode + proposal handler stay active so the agent can iterate.
 		expect(session.planModeState?.enabled).toBe(true);
 		expect(typeof session.planProposalHandler).toBe("function");
 		expect(session.planReferencePath).toBeUndefined();
-		// No mode-exit notifications were emitted.
 		const postDismissUpdates = harness.updates.slice(updatesBefore);
 		expect(
 			postDismissUpdates.some(
@@ -962,6 +1034,86 @@ describe("ACP agent", () => {
 
 		harness.abortController.abort();
 		await Bun.sleep(0);
+	});
+
+	it.each([
+		["explicit refine", { outcome: { outcome: "selected", optionId: "refine" } }],
+		["unknown option", { outcome: { outcome: "selected", optionId: "future-option" } }],
+	] as const)("keeps plan approval pending after %s", async (_label, response) => {
+		const approval = await createPlanApprovalHarness(async () => response);
+		await approval.handler("safety-plan", { toolCallId: `tc-plan-${_label.replaceAll(" ", "-")}` });
+		expectPlanApprovalPending(approval);
+	});
+
+	it("uses permission approval without elicitation.form capability", async () => {
+		const approval = await createPlanApprovalHarness(
+			async () => ({ outcome: { outcome: "selected", optionId: "approve" } }),
+			{},
+		);
+		await approval.handler("safety-plan", { toolCallId: "tc-plan-no-form" });
+		expect(approval.harness.permissionRequests).toHaveLength(1);
+		expect(approval.session.planModeState).toBeUndefined();
+		expect(approval.session.planReferencePath).toBe("local://PLAN.md");
+	});
+
+	it("does not request permission when the proposal signal is already aborted", async () => {
+		let permissionCalls = 0;
+		const approval = await createPlanApprovalHarness(async () => {
+			permissionCalls++;
+			return { outcome: { outcome: "selected", optionId: "approve" } };
+		});
+		const controller = new AbortController();
+		controller.abort();
+		await approval.handler("safety-plan", { toolCallId: "tc-plan-pre-abort", signal: controller.signal });
+		expect(permissionCalls).toBe(0);
+		expectPlanApprovalPending(approval);
+	});
+
+	it("keeps plan approval pending when the proposal is aborted in flight", async () => {
+		const entered = Promise.withResolvers<void>();
+		const permission = Promise.withResolvers<RequestPermissionResponse>();
+		const approval = await createPlanApprovalHarness(async () => {
+			entered.resolve();
+			return permission.promise;
+		});
+		const controller = new AbortController();
+		const result = approval.handler("safety-plan", {
+			toolCallId: "tc-plan-inflight-abort",
+			signal: controller.signal,
+		});
+		await entered.promise;
+		controller.abort();
+		await result;
+		permission.resolve({ outcome: { outcome: "cancelled" } });
+		expectPlanApprovalPending(approval);
+	});
+
+	it("treats an ACP request-cancelled error as non-approval", async () => {
+		const approval = await createPlanApprovalHarness(async () => {
+			throw RequestError.requestCancelled();
+		});
+		await approval.handler("safety-plan", { toolCallId: "tc-plan-request-cancelled" });
+		expectPlanApprovalPending(approval);
+	});
+
+	it("fails closed when the permission transport rejects", async () => {
+		const approval = await createPlanApprovalHarness(async () => {
+			throw new Error("transport down");
+		});
+		await expect(approval.handler("safety-plan", { toolCallId: "tc-plan-transport-error" })).rejects.toThrow(
+			"Plan approval request failed: transport down",
+		);
+		expectPlanApprovalPending(approval);
+	});
+
+	it("fails closed when the client does not implement permission requests", async () => {
+		const approval = await createPlanApprovalHarness(async () => {
+			throw RequestError.methodNotFound("session/request_permission");
+		});
+		await expect(approval.handler("safety-plan", { toolCallId: "tc-plan-method-missing" })).rejects.toThrow(
+			'Plan approval request failed: "Method not found": session/request_permission',
+		);
+		expectPlanApprovalPending(approval);
 	});
 
 	it("pushes config_option_update when thinking level changes internally", async () => {

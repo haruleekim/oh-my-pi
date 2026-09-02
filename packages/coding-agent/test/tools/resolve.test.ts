@@ -42,6 +42,8 @@ function getText(result: { content: Array<{ type: string; text?: string }> }): s
 	return result.content.find(part => part.type === "text")?.text ?? "";
 }
 
+const TEST_CONTEXT = { toolCallId: "test-resolution" };
+
 describe("dispatchResolutionDevice", () => {
 	it("returns usage text for each device", () => {
 		expect(resolutionDeviceUsage(RESOLVE_DEVICE_NAME)).toContain(RESOLVE_DEVICE_PATH);
@@ -56,7 +58,9 @@ describe("dispatchResolutionDevice", () => {
 				clearRuns++;
 			},
 		});
-		await expect(dispatchResolutionDevice(session, RESOLVE_DEVICE_NAME, "looks correct")).rejects.toThrow(
+		await expect(
+			dispatchResolutionDevice(session, RESOLVE_DEVICE_NAME, "looks correct", TEST_CONTEXT),
+		).rejects.toThrow(
 			`No pending action to apply — ${RESOLVE_DEVICE_PATH} is only valid while a staged preview is pending.`,
 		);
 		expect(clearRuns).toBe(1);
@@ -73,6 +77,7 @@ describe("dispatchResolutionDevice", () => {
 			session,
 			REJECT_DEVICE_NAME,
 			"Abandoning the staged edit.",
+			TEST_CONTEXT,
 		);
 		expect(result.isError ?? false).toBe(false);
 		expect(getText(result)).toContain("Nothing to reject");
@@ -106,6 +111,7 @@ describe("dispatchResolutionDevice", () => {
 			createSession({ handler }),
 			REJECT_DEVICE_NAME,
 			"Preview changed wrong callsites",
+			TEST_CONTEXT,
 		);
 
 		expect(getText(result)).toContain("Rejected pending preview.");
@@ -144,6 +150,7 @@ describe("dispatchResolutionDevice", () => {
 			createSession({ handler }),
 			RESOLVE_DEVICE_NAME,
 			"Preview is correct",
+			TEST_CONTEXT,
 		);
 
 		expect(appliedReason).toBe("Preview is correct");
@@ -157,21 +164,26 @@ describe("dispatchResolutionDevice", () => {
 		expect(writeDeviceDispatch("write", { details: { xdev } })?.tool).toBe(RESOLVE_DEVICE_NAME);
 	});
 
-	it("routes propose to the plan proposal handler", async () => {
+	it("routes propose with the real tool context to the plan proposal handler", async () => {
 		let proposedTitle = "";
-		const proposalHandler: PlanProposalHandler = async (title: string) => {
+		let proposedContext: { toolCallId: string; signal?: AbortSignal } | undefined;
+		const proposalHandler: PlanProposalHandler = async (title, context) => {
 			proposedTitle = title;
+			proposedContext = context;
 			return {
 				content: [{ type: "text", text: "Plan ready for approval." }],
 				details: { planFilePath: "local://demo-plan.md", title, planExists: true },
 			};
 		};
+		const signal = new AbortController().signal;
 		const { result, xdev } = await dispatchResolutionDevice(
 			createSession({ proposalHandler }),
 			PROPOSE_DEVICE_NAME,
 			"demo",
+			{ toolCallId: "toolu-propose-demo", signal },
 		);
 		expect(proposedTitle).toBe("demo");
+		expect(proposedContext).toEqual({ toolCallId: "toolu-propose-demo", signal });
 		expect(getText(result)).toContain("Plan ready for approval.");
 		expect(xdev).toMatchObject({ tool: PROPOSE_DEVICE_NAME, mode: "execute", args: { title: "demo" } });
 	});

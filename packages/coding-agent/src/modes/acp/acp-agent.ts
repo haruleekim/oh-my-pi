@@ -29,8 +29,11 @@ import {
 	type NewSessionResponse,
 	PROTOCOL_VERSION,
 	type PromptRequest,
+	type PermissionOption,
 	type PromptResponse,
 	RequestError,
+	type RequestPermissionRequest,
+	type RequestPermissionResponse,
 	type ResumeSessionRequest,
 	type ResumeSessionResponse,
 	type SessionConfigOption,
@@ -64,8 +67,14 @@ import { MCPManager } from "../../mcp/manager";
 import type { MCPServerConfig } from "../../mcp/types";
 import { loadAllExtensions } from "../../modes/components/extensions/state-manager";
 import { theme } from "../../modes/theme/theme";
-import { normalizePlanTitle, type PlanApprovalDetails, resolveApprovedPlan } from "../../plan-mode/approved-plan";
+import {
+	humanizePlanTitle,
+	normalizePlanTitle,
+	type PlanApprovalDetails,
+	resolveApprovedPlan,
+} from "../../plan-mode/approved-plan";
 import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
+import { planMarkdownToolCallContent } from "../../session/acp-tool-content";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "../../session/async-job-delivery";
 import { BlobStore, resolveImageDataSync } from "../../session/blob-store";
 import { LAUNCH_COMPLETION_MESSAGE_TYPE } from "../../session/launch-completion";
@@ -80,6 +89,7 @@ import { refreshAgentDiscovery } from "../../task";
 import { AUTO_THINKING, parseConfiguredThinkingLevel } from "../../thinking";
 import { OTHER_OPTION } from "../../tools/ask";
 import { normalizeLocalScheme } from "../../tools/path-utils";
+import type { PlanProposalContext } from "../../tools/resolve";
 import { ToolError } from "../../tools/tool-errors";
 import {
 	DEFAULT_TTS_LOCAL_MODEL_KEY,
@@ -110,6 +120,13 @@ const ACP_PLAN_MODE_ID = "plan";
 const DEFAULT_PLAN_FILE_URL = "local://PLAN.md";
 const APPROVE_OPTION = "Approve and execute";
 const REFINE_OPTION = "Refine plan";
+const PLAN_APPROVE_OPTION_ID = "approve";
+const PLAN_REFINE_OPTION_ID = "refine";
+const PLAN_PERMISSION_OPTIONS: PermissionOption[] = [
+	{ optionId: PLAN_APPROVE_OPTION_ID, name: APPROVE_OPTION, kind: "allow_once" },
+	{ optionId: PLAN_REFINE_OPTION_ID, name: REFINE_OPTION, kind: "reject_once" },
+];
+const ACP_REQUEST_CANCELLED_CODE = -32800;
 const MODE_CONFIG_ID = "mode";
 const MODEL_CONFIG_ID = "model";
 const THINKING_CONFIG_ID = "thinking";
@@ -2131,7 +2148,7 @@ export class AcpAgent implements Agent {
 			// handler that consumes `xd://propose` writes from plan mode. Without
 			// this, proposal dispatch falls through and plan mode has no approval
 			// path (issue #1869).
-			session.setPlanProposalHandler?.(title => this.#handleAcpPlanProposal(session, title));
+			session.setPlanProposalHandler?.((title, context) => this.#handleAcpPlanProposal(session, title, context));
 		} else {
 			session.setPlanProposalHandler?.(null);
 			session.setPlanModeState(undefined);
@@ -2142,16 +2159,19 @@ export class AcpAgent implements Agent {
 	 * Plan-proposal handler installed while ACP plan mode is active. The agent
 	 * submits the finalized plan by writing its `<slug>`/title to
 	 * `xd://propose`; this handler validates the plan file, normalizes the
-	 * title, asks the ACP client to confirm (via `unstable_createElicitation`
-	 * when supported), and on approval keeps the chosen plan path, exits plan
-	 * mode, and notifies the client so the agent regains full tools.
+	 * title, asks the ACP client for permission on the existing propose tool
+	 * call, and on approval keeps the chosen plan path, exits plan mode, and
+	 * notifies the client so the agent regains full tools.
 	 *
 	 * Mirrors `InteractiveMode.#handlePlanProposal` for the parts the agent sees
-	 * (same `PlanApprovalDetails` shape). Clients without form-mode elicitation
-	 * get an auto-approve so plan mode is never stranded — the agent always has
-	 * a way out.
+	 * (same `PlanApprovalDetails` shape). Permission failures never grant approval
+	 * or mutate plan state.
 	 */
-	async #handleAcpPlanProposal(session: AgentSession, title: string): Promise<AgentToolResult<unknown>> {
+	async #handleAcpPlanProposal(
+		session: AgentSession,
+		title: string,
+		context: PlanProposalContext,
+	): Promise<AgentToolResult<unknown>> {
 		const state = session.getPlanModeState();
 		if (!state?.enabled) {
 			throw new ToolError("Plan mode is not active.");
@@ -2166,7 +2186,7 @@ export class AcpAgent implements Agent {
 			readPlan: url => this.#readAcpPlanFile(session, url),
 			listPlanFiles: () => this.#listAcpLocalPlanFiles(session),
 		});
-		const approved = await this.#requestAcpPlanApprovalChoice(session.sessionId, resolvedTitle, planContent);
+		const approved = await this.#requestAcpPlanApprovalChoice(session.sessionId, context, resolvedTitle, planContent);
 		const details: PlanApprovalDetails = {
 			planFilePath,
 			title: resolvedTitle,
@@ -2263,30 +2283,50 @@ export class AcpAgent implements Agent {
 	}
 
 	/**
-	 * Ask the ACP client to confirm plan approval. Returns `true` only on an
-	 * explicit `APPROVE_OPTION` selection. Refine, dismissal (`undefined`), or
-	 * any unrecognized value falls through to refine semantics — the caller
-	 * keeps plan mode active and surfaces guidance text to the agent. Clients
-	 * without `elicitation.form` support auto-approve because there is no
-	 * confirmation surface available; without that, plan mode would strand
-	 * the agent (the bug this method exists to fix).
+	 * Ask the ACP client to approve the plan on the existing `xd://propose`
+	 * tool card. Only the explicit approve option grants write access; every
+	 * cancellation and unknown response keeps plan mode active.
 	 */
-	async #requestAcpPlanApprovalChoice(sessionId: string, title: string, planContent: string): Promise<boolean> {
-		const supportsForm = this.#clientCapabilities?.elicitation?.form != null;
-		if (!supportsForm) return true;
-		const message = `Approve plan "${title}" and start implementation?\n\n${planContent}`;
-		const value = await elicitFromAcpClient(
-			this.#connection,
+	async #requestAcpPlanApprovalChoice(
+		sessionId: string,
+		context: PlanProposalContext,
+		title: string,
+		planContent: string,
+	): Promise<boolean> {
+		if (context.signal?.aborted) return false;
+		const request: RequestPermissionRequest = {
 			sessionId,
-			"select",
-			message,
-			{ type: "string", enum: [APPROVE_OPTION, REFINE_OPTION] },
-			undefined,
-		);
-		// Approve ONLY on the explicit approve selection. Dismissal, cancel,
-		// timeout, or any other non-approve response falls through to refine
-		// semantics so closing the dialog can never grant write access.
-		return value === APPROVE_OPTION;
+			toolCall: {
+				toolCallId: context.toolCallId,
+				title: `Review plan: ${humanizePlanTitle(title)}`,
+				kind: "switch_mode",
+				status: "pending",
+				content: [planMarkdownToolCallContent(context.toolCallId, planContent)],
+			},
+			options: PLAN_PERMISSION_OPTIONS,
+		};
+		type PermissionRaceResult = { kind: "response"; response: RequestPermissionResponse } | { kind: "aborted" };
+		const { promise: abortPromise, resolve: resolveAbort } = Promise.withResolvers<PermissionRaceResult>();
+		const onAbort = () => resolveAbort({ kind: "aborted" });
+		context.signal?.addEventListener("abort", onAbort, { once: true });
+		let raced: PermissionRaceResult;
+		try {
+			const permissionPromise = this.#connection
+				.requestPermission(request)
+				.then(response => ({ kind: "response" as const, response }));
+			raced = await Promise.race([permissionPromise, abortPromise]);
+		} catch (error) {
+			if (error instanceof RequestError && error.code === ACP_REQUEST_CANCELLED_CODE) {
+				return false;
+			}
+			const cause = error instanceof Error ? error.message : String(error);
+			throw new ToolError(`Plan approval request failed: ${cause}`);
+		} finally {
+			context.signal?.removeEventListener("abort", onAbort);
+		}
+		if (raced.kind === "aborted") return false;
+		const outcome = raced.response.outcome;
+		return outcome.outcome === "selected" && outcome.optionId === PLAN_APPROVE_OPTION_ID;
 	}
 
 	#buildModeState(session: AgentSession): SessionModeState {

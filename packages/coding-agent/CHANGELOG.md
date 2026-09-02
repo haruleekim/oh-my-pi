@@ -24,6 +24,7 @@
 ### Changed
 
 - Eval and shell source sent to ACP clients now carries language metadata, enabling syntax highlighting in supporting editors.
+- ACP plan approval now renders the complete plan as Markdown in supporting clients and uses explicit approve/refine permission choices.
 
 ### Fixed
 

@@ -13,3 +13,17 @@ export function shellSourceToolCallContent(toolCallId: string, command: string):
 		},
 	};
 }
+
+export function planMarkdownToolCallContent(toolCallId: string, planContent: string): ToolCallContent {
+	return {
+		type: "content",
+		content: {
+			type: "resource",
+			resource: {
+				uri: `omp-plan://tool/${encodeURIComponent(toolCallId)}/plan.md`,
+				text: planContent,
+				mimeType: "text/markdown",
+			},
+		},
+	};
+}

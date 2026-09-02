@@ -149,7 +149,7 @@ describe("AgentSession resolve reminder", () => {
 		});
 
 		expect(isSoftToolRequirement(session.nextToolChoiceDirective())).toBe(true);
-		await dispatchResolutionDevice(toolSession, "resolve", "looks correct");
+		await dispatchResolutionDevice(toolSession, "resolve", "looks correct", { toolCallId: "resolve-test" });
 
 		expect(applyRuns).toBe(1);
 		expect(session.nextToolChoiceDirective()).toBeUndefined();
@@ -170,7 +170,9 @@ describe("AgentSession resolve reminder", () => {
 			peekPlanProposalHandler: () => undefined,
 		} as ToolSession;
 
-		const { result } = await dispatchResolutionDevice(facade, "reject", "drain stale gate");
+		const { result } = await dispatchResolutionDevice(facade, "reject", "drain stale gate", {
+			toolCallId: "reject-test",
+		});
 		expect(result.isError ?? false).toBe(false);
 		expect(session.nextToolChoiceDirective()).toBeUndefined();
 	});
