@@ -34,6 +34,7 @@ import {
 import { FileChangeType, notifyWorkspaceWatchedFiles } from "../lsp/client";
 import { DeferredDiagnostics } from "../lsp/deferred-diagnostics";
 import { getDiagnosticsLedger } from "../lsp/diagnostics-ledger";
+import { MAX_EDIT_SNAPSHOT_TEXT_CHARS } from "./snapshot-details";
 import type { ToolSession } from "../tools";
 import { routeWriteThroughBridge } from "../tools/acp-bridge";
 import { truncateForPrompt } from "../tools/approval";
@@ -261,9 +262,9 @@ function aggregateDetails(files: readonly EditFileOutcome[], mode: EditMode): Ed
  * result. The engine already prunes each file on its own; this keeps a
  * many-small-files batch from accumulating unbounded snapshot bytes in the
  * session JSONL (#3787). Early entries keep their diff visualization; later
- * ones degrade to text-only.
+ * ones degrade to text-only. The per-result budget itself lives with the
+ * TypeScript-side pruning helper so both cannot drift apart.
  */
-const MAX_EDIT_SNAPSHOT_TEXT_CHARS = 32_768;
 
 function capPerFileSnapshots(entries: EditToolPerFileResult[]): EditToolPerFileResult[] {
 	let remaining = MAX_EDIT_SNAPSHOT_TEXT_CHARS;

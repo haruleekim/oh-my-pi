@@ -22,6 +22,7 @@ import {
 } from "@oh-my-pi/pi-utils/ar";
 import { getEditStore } from "../edit/store";
 import { normalizeToLF } from "../edit/normalize";
+import { pruneOversizedSnapshot } from "../edit/snapshot-details";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { InternalUrlRouter } from "../internal-urls";
 import { parseInternalUrl } from "../internal-urls/parse";
@@ -319,6 +320,14 @@ export interface WriteToolDetails {
 	/** Absolute filesystem path the write resolved to. Used by the renderer to wrap
 	 * the (possibly cwd-relative) header path in an OSC 8 `file://` hyperlink. */
 	resolvedPath?: string;
+	/** Absolute filesystem path used by ACP diff consumers. */
+	path?: string;
+	/** Source-of-truth content before the write; absent for a newly-created file. */
+	oldText?: string;
+	/** Source-of-truth content after the write. */
+	newText?: string;
+	/** Set when the pre/post snapshots exceeded the persisted-details budget. */
+	snapshotsPruned?: boolean;
 	/** Set when the write dispatched an `xd://` tool device; drives renderer delegation. */
 	xdev?: XdevDispatch;
 }
@@ -1290,9 +1299,13 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			const absolutePath = resolvePlanPath(this.session, path);
 			const batchRequest = getLspBatchRequest(context?.toolCall);
 
-			// Check if file exists and is auto-generated before overwriting
-			if (await fs.exists(absolutePath)) {
+			const destination = Bun.file(absolutePath);
+			let oldText: string | undefined;
+			try {
+				oldText = await destination.text();
 				await assertEditableFile(absolutePath, path, this.session.settings);
+			} catch (error) {
+				if (!isEnoent(error)) throw error;
 			}
 
 			const displayPath = formatPathRelativeToCwd(absolutePath, this.session.cwd);
@@ -1317,9 +1330,16 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				if (madeExecutable) {
 					resultText += `\n${EXECUTABLE_NOTICE}`;
 				}
+				const details = pruneOversizedSnapshot<WriteToolDetails>({
+					resolvedPath: absolutePath,
+					path: absolutePath,
+					...(oldText === undefined ? {} : { oldText }),
+					newText: bridgeWrite.text,
+					...(madeExecutable ? { madeExecutable: true } : {}),
+				});
 				return {
 					content: [{ type: "text", text: resultText }],
-					details: { resolvedPath: absolutePath, madeExecutable: madeExecutable || undefined },
+					details,
 				};
 			}
 
@@ -1331,6 +1351,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				batchRequest,
 				dst => this.#deferredDiagnostics?.begin(dst),
 			);
+			const newText = await destination.text();
 			invalidateFsScanAfterWrite(absolutePath);
 			if (!this.#deferredDiagnostics || batchRequest?.flush === false) {
 				this.session.bumpFileMutationVersion?.(absolutePath);
@@ -1346,23 +1367,24 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			if (madeExecutable) {
 				resultText += `\n${EXECUTABLE_NOTICE}`;
 			}
-			if (!diagnostics) {
-				return {
-					content: [{ type: "text", text: resultText }],
-					details: { resolvedPath: absolutePath, madeExecutable: madeExecutable || undefined },
-				};
-			}
-
+			const details = pruneOversizedSnapshot<WriteToolDetails>({
+				resolvedPath: absolutePath,
+				path: absolutePath,
+				...(oldText === undefined ? {} : { oldText }),
+				newText,
+				...(madeExecutable ? { madeExecutable: true } : {}),
+				...(diagnostics
+					? {
+							diagnostics,
+							meta: outputMeta()
+								.diagnostics(diagnostics.summary, diagnostics.messages ?? [])
+								.get(),
+						}
+					: {}),
+			});
 			return {
 				content: [{ type: "text", text: resultText }],
-				details: {
-					resolvedPath: absolutePath,
-					diagnostics,
-					madeExecutable: madeExecutable || undefined,
-					meta: outputMeta()
-						.diagnostics(diagnostics.summary, diagnostics.messages ?? [])
-						.get(),
-				},
+				details,
 			};
 		});
 	}

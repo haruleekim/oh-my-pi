@@ -1844,14 +1844,33 @@ describe("Coding Agent Tools", () => {
 	});
 
 	describe("write tool", () => {
-		it("should write file contents", async () => {
+		it("returns source snapshots for ACP create and overwrite diffs", async () => {
 			const testFile = path.join(testDir, "write-test.txt");
-			const content = "Test content";
+			const initialContent = "Initial content";
+			const replacementContent = "Replacement content";
 
-			const result = await writeTool.execute("test-call-3", { path: testFile, content });
+			const createResult = await writeTool.execute("test-call-write-create", {
+				path: testFile,
+				content: initialContent,
+			});
 
-			expect(getTextOutput(result)).toContain("Successfully wrote");
-			expect(getTextOutput(result)).toContain(path.basename(testFile));
+			expect(getTextOutput(createResult)).toContain("Successfully wrote");
+			expect(createResult.details).toMatchObject({
+				path: testFile,
+				newText: initialContent,
+			});
+			expect(createResult.details?.oldText).toBeUndefined();
+
+			const overwriteResult = await writeTool.execute("test-call-write-overwrite", {
+				path: testFile,
+				content: replacementContent,
+			});
+
+			expect(overwriteResult.details).toMatchObject({
+				path: testFile,
+				oldText: initialContent,
+				newText: replacementContent,
+			});
 		});
 
 		it("should create parent directories", async () => {
