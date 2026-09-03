@@ -73,6 +73,7 @@ import {
 	type PlanApprovalDetails,
 	resolveApprovedPlan,
 } from "../../plan-mode/approved-plan";
+import { getEditStore } from "../../edit/store";
 import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
 import { planMarkdownToolCallContent } from "../../session/acp-tool-content";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "../../session/async-job-delivery";
@@ -1720,6 +1721,7 @@ export class AcpAgent implements Agent {
 			getMessageId: message => this.#getLiveMessageId(record, message),
 			getMessageProgress: message => this.#getLiveMessageProgress(record, message),
 			getToolArgs: toolCallId => record.toolArgsById.get(toolCallId),
+			getFileSnapshot: (path, versionId) => getEditStore(record.session).byHashText(path, versionId) ?? undefined,
 			cwd: record.session.sessionManager.getCwd(),
 			resolveImageData: resolveImageDataForAcp,
 		})) {

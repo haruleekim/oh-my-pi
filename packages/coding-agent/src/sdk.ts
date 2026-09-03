@@ -171,6 +171,7 @@ import {
 	wrapSteeringForModel,
 } from "./session/messages";
 import { clampProviderContextImages, dropUnreadableContextImages } from "./session/provider-image-budget";
+import { getEditStore } from "./edit/store";
 import {
 	expandDefaultRetryFallbackChains,
 	findRetryFallbackCandidates,
@@ -1936,6 +1937,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			return getEnabledEvalPreludes(builtins);
 		};
 		toolSession.getEvalPreludes = getEvalPreludes;
+		const fileSnapshotStore = getEditStore(toolSession);
 
 		// Wire process-wide internal URL singletons owned by their real classes.
 		// Top-level sessions install the active snapshots; subagents inherit them.
@@ -3837,6 +3839,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			advisorMcpResources: cursorMcpResources,
 			titleSystemPrompt: options.titleSystemPrompt,
 		});
+		session.editStore = fileSnapshotStore;
 		hasSession = true;
 		// Backfill the resumed advisor spend without blocking startup: the scan
 		// runs after the session is live, so `--resume` no longer scales with the

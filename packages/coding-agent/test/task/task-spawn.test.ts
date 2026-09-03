@@ -155,7 +155,7 @@ function createExecutorSession(options: ExecutorSessionOptions): AgentSession {
 	};
 	const settings = Settings.isolated({
 		"async.enabled": false,
-		"task.isolation.mode": "none",
+		"task.isolation.enabled": false,
 		"task.maxRecursionDepth": 4,
 		"task.softRequestBudget": 0,
 	});
@@ -901,7 +901,7 @@ describe("subagent session readiness", () => {
 			modelRegistry,
 			settings: Settings.isolated({
 				"async.enabled": false,
-				"task.isolation.mode": "none",
+				"task.isolation.enabled": false,
 				"task.maxRecursionDepth": 4,
 				"task.softRequestBudget": 0,
 			}),

@@ -694,6 +694,133 @@ describe("ACP event mapper", () => {
 		expect(update.locations).toEqual([{ path: "single.ts" }]);
 	});
 
+	it("does not emit a half diff when one referenced snapshot is unavailable", () => {
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-missing-snapshot",
+				toolName: "edit",
+				isError: false,
+				result: {
+					content: [{ type: "text", text: "[large.ts#ABCD]\n1:after" }],
+					details: {
+						path: "large.ts",
+						oldSnapshotRef: { path: "large.ts", versionId: "missing" },
+						newText: "after",
+					},
+				},
+			} as AgentSessionEvent,
+			"session-1",
+			{ getFileSnapshot: () => undefined },
+		);
+
+		const update = updates[0]!.update as {
+			content?: Array<{ type: string; content?: { type: string; text?: string } }>;
+		};
+		expect(update.content?.filter(block => block.type === "diff")).toEqual([]);
+		const fallback = update.content?.find(block => block.type === "content")?.content?.text;
+		expect(fallback).toContain("large.ts");
+		expect(fallback).toContain("evicted");
+	});
+
+	it("omits model-facing hashline text when every mutation has a native diff", () => {
+		const result = {
+			content: [{ type: "text", text: "[small.ts#ABCD]\n1:after" }],
+			details: {
+				path: "small.ts",
+				oldText: "before",
+				newText: "after",
+			},
+		};
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-complete-diff",
+				toolName: "edit",
+				isError: false,
+				result,
+			} as AgentSessionEvent,
+			"session-1",
+		);
+
+		expect(updates[0]!.update).toMatchObject({
+			content: [{ type: "diff", path: "small.ts", oldText: "before", newText: "after" }],
+			rawOutput: result,
+		});
+	});
+
+	it("renders structured mutation notices without restoring the hashline preview", () => {
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-diff-notice",
+				toolName: "edit",
+				isError: false,
+				result: {
+					content: [{ type: "text", text: "[small.ts#ABCD]\n1:after\n\nWarnings:\nParser warning" }],
+					details: {
+						path: "small.ts",
+						oldText: "before",
+						newText: "after",
+						notices: ["Parser warning"],
+					},
+				},
+			} as AgentSessionEvent,
+			"session-1",
+		);
+
+		expect(updates[0]!.update).toMatchObject({
+			content: [
+				{ type: "diff", path: "small.ts", oldText: "before", newText: "after" },
+				{ type: "content", content: { type: "text", text: "Parser warning" } },
+			],
+		});
+	});
+
+	it("keeps successful diffs and names entries that require text fallback", () => {
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-partial-diff",
+				toolName: "edit",
+				isError: false,
+				result: {
+					content: [{ type: "text", text: "raw preview for both files" }],
+					details: {
+						perFileResults: [
+							{ path: "small.ts", oldText: "before", newText: "after" },
+							{
+								path: "huge.ts",
+								snapshotsPruned: true,
+								snapshotFallback: "file-limit",
+							},
+						],
+					},
+				},
+			} as AgentSessionEvent,
+			"session-1",
+		);
+
+		const content = (
+			updates[0]!.update as {
+				content?: Array<{
+					type: string;
+					path?: string;
+					oldText?: string | null;
+					newText?: string;
+					content?: { type: string; text?: string };
+				}>;
+			}
+		).content;
+		expect(content?.filter(block => block.type === "diff")).toEqual([
+			{ type: "diff", path: "small.ts", oldText: "before", newText: "after" },
+		]);
+		const fallback = content?.find(block => block.type === "content")?.content?.text;
+		expect(fallback).toContain("huge.ts");
+		expect(fallback).toContain("file-limit");
+		expect(fallback).not.toContain("raw preview for both files");
+	});
+
 	it("resolves live image blob refs for ACP content without expanding rawOutput", () => {
 		const blobRef = "blob:sha256:77467fcfe2bbdc034e0eabb4778c9d7de521c0d7c3e0d0a62566468e4d7da3a5";
 		const resolvedImageData = "resolved-webp-base64";

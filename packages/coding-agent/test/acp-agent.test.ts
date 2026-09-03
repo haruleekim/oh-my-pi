@@ -3,11 +3,13 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
+import type { EditStore } from "@oh-my-pi/pi-natives";
 import { AgentBusyError } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { type AsyncJob, AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { getEditStore } from "@oh-my-pi/pi-coding-agent/edit";
 import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { resolveLocalUrlToPath } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import type { DaemonBrokerClient } from "@oh-my-pi/pi-coding-agent/launch/client";
@@ -51,6 +53,7 @@ import type {
 	RequestPermissionRequest,
 	RequestPermissionResponse,
 	SessionNotification,
+	SessionUpdate,
 	Validator,
 } from "@oh-my-pi/pi-utils/acp";
 import {
@@ -136,6 +139,7 @@ class FakeAgentSession {
 	sessionManager: SessionManager;
 	sessionId: string;
 	agent: { sessionId: string; waitForIdle: () => Promise<void> };
+	editStore?: EditStore;
 	agentId: string;
 	clientBridge: ClientBridge | undefined = undefined;
 	model: Model | undefined;
@@ -1598,6 +1602,67 @@ describe("ACP agent", () => {
 		await harness.agent.dispose();
 	});
 
+	it("resolves session snapshot references for live edit updates", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId);
+		if (!session) throw new Error("Expected live ACP session");
+		const targetPath = path.join(harness.cwdA, "large.ts");
+		const store = getEditStore(session);
+		const oldVersion = { versionId: store.recordSnapshot(targetPath, "before") };
+		const newVersion = { versionId: store.recordSnapshot(targetPath, "after") };
+		session.prompt = async text => {
+			session.promptCalls.push(text);
+			session.isStreaming = true;
+			for (const listener of session.listeners()) {
+				listener({
+					type: "tool_execution_start",
+					toolCallId: "live-large-edit",
+					toolName: "edit",
+					args: { path: targetPath, input: "edit" },
+				});
+				listener({
+					type: "tool_execution_end",
+					toolCallId: "live-large-edit",
+					toolName: "edit",
+					isError: false,
+					result: {
+						content: [{ type: "text", text: "[large.ts#ABCD]\n1:after" }],
+						details: {
+							path: targetPath,
+							oldSnapshotRef: { path: targetPath, versionId: oldVersion.versionId },
+							newSnapshotRef: { path: targetPath, versionId: newVersion.versionId },
+						},
+					},
+				});
+			}
+			const assistant = makeAssistantMessage("edited");
+			session.sessionManager.appendMessage(assistant);
+			for (const listener of session.listeners()) {
+				listener({ type: "agent_end", messages: [assistant] });
+			}
+			session.isStreaming = false;
+			return true;
+		};
+
+		await harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "edit it" }],
+		});
+
+		const update = harness.updates.find(
+			notification =>
+				notification.update.sessionUpdate === "tool_call_update" &&
+				notification.update.toolCallId === "live-large-edit",
+		)?.update;
+		expect(update).toMatchObject({
+			status: "completed",
+			content: [{ type: "diff", path: targetPath, oldText: "before", newText: "after" }],
+		});
+
+		await harness.agent.dispose();
+	});
+
 	it("replays messageIds and returns turn usage for prompts", async () => {
 		const harness = await createHarness();
 		const stored = new FakeAgentSession(harness.cwdA);
@@ -1995,6 +2060,78 @@ describe("ACP agent", () => {
 			expect.objectContaining({
 				content: expect.arrayContaining([{ type: "content", content: { type: "text", text: "tests passed" } }]),
 			}),
+		);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("replays inline edit diffs and degrades session-only snapshot references", async () => {
+		const harness = await createHarness();
+		const stored = new FakeAgentSession(harness.cwdA);
+		harness.sessions.push(stored);
+		stored.sessionManager.appendMessage({
+			...makeAssistantMessage(""),
+			content: [
+				{
+					type: "toolCall",
+					id: "toolu_inline_edit_replay",
+					name: "edit",
+					arguments: { path: "small.ts", input: "inline" },
+				},
+				{
+					type: "toolCall",
+					id: "toolu_referenced_edit_replay",
+					name: "edit",
+					arguments: { path: "large.ts", input: "referenced" },
+				},
+			],
+		});
+		stored.sessionManager.appendMessage({
+			role: "toolResult",
+			toolCallId: "toolu_inline_edit_replay",
+			toolName: "edit",
+			content: [{ type: "text", text: "[small.ts#ABCD]\n1:after" }],
+			details: { path: "small.ts", oldText: "before", newText: "after" },
+			isError: false,
+			timestamp: Date.now(),
+		});
+		stored.sessionManager.appendMessage({
+			role: "toolResult",
+			toolCallId: "toolu_referenced_edit_replay",
+			toolName: "edit",
+			content: [{ type: "text", text: "[large.ts#EF01]\n1:after" }],
+			details: {
+				path: "large.ts",
+				oldSnapshotRef: { path: "large.ts", versionId: "session-only-old" },
+				newSnapshotRef: { path: "large.ts", versionId: "session-only-new" },
+			},
+			isError: false,
+			timestamp: Date.now(),
+		});
+		await stored.sessionManager.ensureOnDisk();
+		await stored.sessionManager.flush();
+
+		await harness.agent.loadSession({
+			sessionId: stored.sessionId,
+			cwd: harness.cwdA,
+			mcpServers: [],
+		});
+
+		const completions = harness.updates
+			.filter(update => update.sessionId === stored.sessionId)
+			.map(notification => notification.update)
+			.filter(
+				(update): update is Extract<SessionUpdate, { sessionUpdate: "tool_call_update" }> =>
+					update.sessionUpdate === "tool_call_update" && update.status === "completed",
+			);
+		const inline = completions.find(update => update.toolCallId === "toolu_inline_edit_replay");
+		const referenced = completions.find(update => update.toolCallId === "toolu_referenced_edit_replay");
+		expect(inline?.content).toEqual([{ type: "diff", path: "small.ts", oldText: "before", newText: "after" }]);
+		expect(referenced?.content?.filter(block => block.type === "diff")).toEqual([]);
+		const fallback = referenced?.content?.find(block => block.type === "content");
+		expect(fallback?.type === "content" && fallback.content.type === "text" ? fallback.content.text : "").toContain(
+			"large.ts",
 		);
 
 		harness.abortController.abort();

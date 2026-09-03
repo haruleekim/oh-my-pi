@@ -25,6 +25,7 @@ interface AcpEventMapperOptions {
 	getMessageProgress?: (message: unknown) => MessageProgress | undefined;
 	getToolArgs?: (toolCallId: string) => unknown;
 	resolveImageData?: (data: string, mimeType: string | undefined) => string;
+	getFileSnapshot?: (path: string, versionId: string) => string | undefined;
 	/**
 	 * Session cwd. Tool call locations sent to ACP clients must be absolute
 	 * (the editor host needs them to open or focus files). When provided,
@@ -266,10 +267,25 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 		case "tool_execution_end": {
 			const args = getToolExecutionEndArgs(event, options);
 			if (isInternalHubMessageTool(event.toolName, args)) return [];
-			const resultContent = [
-				...extractDiffToolCallContent(event.result),
-				...extractToolCallContent(event.result, options),
-			];
+			const diffContent = extractDiffToolCallContent(event.result, options);
+			const fileMutation = isFileMutationToolName(event.toolName);
+			const hasCompleteMutationDiff =
+				!event.isError &&
+				fileMutation &&
+				diffContent.entryCount > 0 &&
+				diffContent.blocks.length === diffContent.entryCount;
+			const usesStructuredMutationPresentation =
+				!event.isError && fileMutation && (hasCompleteMutationDiff || diffContent.fallbacks.length > 0);
+			const fallbackContent =
+				usesStructuredMutationPresentation && diffContent.fallbacks.length > 0
+					? [textToolCallContent(formatDiffFallbacks(diffContent.fallbacks))]
+					: hasCompleteMutationDiff
+						? []
+						: extractToolCallContent(event.result, options);
+			const noticeContent = usesStructuredMutationPresentation
+				? extractMutationNotices(event.result).map(textToolCallContent)
+				: [];
+			const resultContent = [...diffContent.blocks, ...fallbackContent, ...noticeContent];
 			const content = mergeToolUpdateContent(
 				buildToolStartContent(event.toolCallId, event.toolName, args),
 				resultContent,
@@ -648,6 +664,10 @@ function isCommandToolName(toolName: string): boolean {
 	return toolName === "bash" || toolName === "shell" || toolName === "exec";
 }
 
+function isFileMutationToolName(toolName: string): boolean {
+	return toolName === "edit" || toolName === "write";
+}
+
 function buildToolTitle(toolName: string, args: unknown, intent: string | undefined): string {
 	let title: string | undefined;
 	if (isCommandToolName(toolName)) {
@@ -773,35 +793,118 @@ function extractToolLocationsFromResult(result: unknown, cwd?: string): ToolCall
 	return locations;
 }
 
-/** Emit a `diff` ToolCallContent for each per-file edit result that carries oldText/newText. */
-function extractDiffToolCallContent(result: unknown): ToolCallContent[] {
-	if (typeof result !== "object" || result === null) return [];
-	const details = (result as { details?: unknown }).details;
-	if (typeof details !== "object" || details === null) return [];
-	const blocks: ToolCallContent[] = [];
-	const perFile = (details as { perFileResults?: unknown }).perFileResults;
-	const entries: unknown[] = Array.isArray(perFile) ? perFile : [details];
-	for (const entry of entries) {
-		const block = buildDiffContent(entry);
-		if (block) blocks.push(block);
-	}
-	return blocks;
+function extractMutationNotices(result: unknown): string[] {
+	if (typeof result !== "object" || result === null || !("details" in result)) return [];
+	const details = result.details;
+	if (typeof details !== "object" || details === null || !("notices" in details)) return [];
+	const notices = details.notices;
+	return Array.isArray(notices)
+		? notices.filter((notice): notice is string => typeof notice === "string" && notice.length > 0)
+		: [];
+}
+interface DiffFallback {
+	path: string;
+	reason: string;
 }
 
-function buildDiffContent(entry: unknown): ToolCallContent | undefined {
+function extractDiffFallback(entry: unknown): DiffFallback | undefined {
+	if (typeof entry !== "object" || entry === null || !("path" in entry) || typeof entry.path !== "string") {
+		return undefined;
+	}
+	const explicit = "snapshotFallback" in entry ? entry.snapshotFallback : undefined;
+	if (typeof explicit === "string") return { path: entry.path, reason: explicit };
+	if ("oldSnapshotRef" in entry || "newSnapshotRef" in entry) {
+		return { path: entry.path, reason: "evicted" };
+	}
+	if ("snapshotsPruned" in entry && entry.snapshotsPruned === true) {
+		return { path: entry.path, reason: "unavailable" };
+	}
+	if ("isError" in entry && entry.isError === true) {
+		return { path: entry.path, reason: "edit-error" };
+	}
+	return undefined;
+}
+
+function formatDiffFallbacks(fallbacks: readonly DiffFallback[]): string {
+	return `Diff preview unavailable:\n${fallbacks.map(item => `- ${item.path}: ${item.reason}`).join("\n")}`;
+}
+
+/** Emit `diff` ToolCallContent plus coverage and fallback metadata. */
+function extractDiffToolCallContent(
+	result: unknown,
+	options: AcpEventMapperOptions,
+): { blocks: ToolCallContent[]; entryCount: number; fallbacks: DiffFallback[] } {
+	if (typeof result !== "object" || result === null || !("details" in result)) {
+		return { blocks: [], entryCount: 0, fallbacks: [] };
+	}
+	const details = result.details;
+	if (typeof details !== "object" || details === null) {
+		return { blocks: [], entryCount: 0, fallbacks: [] };
+	}
+	const blocks: ToolCallContent[] = [];
+	const fallbacks: DiffFallback[] = [];
+	const perFile = "perFileResults" in details ? details.perFileResults : undefined;
+	const entries: unknown[] = Array.isArray(perFile) ? perFile : [details];
+	for (const entry of entries) {
+		const block = buildDiffContent(entry, options);
+		if (block) {
+			blocks.push(block);
+		} else {
+			const fallback = extractDiffFallback(entry);
+			if (fallback) fallbacks.push(fallback);
+		}
+	}
+	return { blocks, entryCount: entries.length, fallbacks };
+}
+
+function resolveDiffSide(
+	inlineText: unknown,
+	ref: unknown,
+	options: AcpEventMapperOptions,
+): { present: false } | { present: true; text: string } | { present: true; unavailable: true } {
+	if (typeof inlineText === "string") return { present: true, text: inlineText };
+	if (ref === undefined) return { present: false };
+	if (typeof ref !== "object" || ref === null || !("path" in ref) || !("versionId" in ref)) {
+		return { present: true, unavailable: true };
+	}
+	const path = ref.path;
+	const versionId = ref.versionId;
+	if (typeof path !== "string" || typeof versionId !== "string") {
+		return { present: true, unavailable: true };
+	}
+	const text = options.getFileSnapshot?.(path, versionId);
+	return text === undefined ? { present: true, unavailable: true } : { present: true, text };
+}
+
+function buildDiffContent(entry: unknown, options: AcpEventMapperOptions): ToolCallContent | undefined {
 	if (typeof entry !== "object" || entry === null) return undefined;
-	const candidate = entry as { path?: unknown; oldText?: unknown; newText?: unknown; isError?: unknown };
-	if (candidate.isError === true) return undefined;
-	const path = typeof candidate.path === "string" && candidate.path.length > 0 ? candidate.path : undefined;
+	const isError = "isError" in entry ? entry.isError : undefined;
+	if (isError === true) return undefined;
+	const pathValue = "path" in entry ? entry.path : undefined;
+	const path = typeof pathValue === "string" && pathValue.length > 0 ? pathValue : undefined;
 	if (!path) return undefined;
-	const oldText = typeof candidate.oldText === "string" ? candidate.oldText : undefined;
-	const newText = typeof candidate.newText === "string" ? candidate.newText : undefined;
-	if (oldText === undefined && newText === undefined) return undefined;
+	const oldSide = resolveDiffSide(
+		"oldText" in entry ? entry.oldText : undefined,
+		"oldSnapshotRef" in entry ? entry.oldSnapshotRef : undefined,
+		options,
+	);
+	const newSide = resolveDiffSide(
+		"newText" in entry ? entry.newText : undefined,
+		"newSnapshotRef" in entry ? entry.newSnapshotRef : undefined,
+		options,
+	);
+	if (
+		(oldSide.present && "unavailable" in oldSide) ||
+		(newSide.present && "unavailable" in newSide) ||
+		(!oldSide.present && !newSide.present)
+	) {
+		return undefined;
+	}
 	return {
 		type: "diff",
 		path,
-		oldText: oldText ?? null,
-		newText: newText ?? "",
+		oldText: oldSide.present ? oldSide.text : null,
+		newText: newSide.present ? newSide.text : "",
 	};
 }
 

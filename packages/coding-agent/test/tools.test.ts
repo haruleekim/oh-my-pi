@@ -8,8 +8,14 @@ import type { AgentTool, AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { DEFAULT_BASH_INTERCEPTOR_RULES, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { EditTool, MAX_EDIT_SNAPSHOT_TEXT_CHARS } from "@oh-my-pi/pi-coding-agent/edit";
+import {
+	EditTool,
+	getEditStore,
+	MAX_EDIT_SNAPSHOT_TEXT_CHARS,
+	SNAPSHOT_MAX_BYTES,
+} from "@oh-my-pi/pi-coding-agent/edit";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import type { ClientBridge } from "@oh-my-pi/pi-coding-agent/session/client-bridge";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { wrapToolWithMetaNotice } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
@@ -1873,28 +1879,76 @@ describe("Coding Agent Tools", () => {
 			});
 		});
 
-		it("prunes oversized and binary ACP write snapshots", async () => {
-			const oversizedPath = path.join(testDir, "oversized-write.txt");
-			fs.writeFileSync(oversizedPath, "x".repeat(MAX_EDIT_SNAPSHOT_TEXT_CHARS));
+		it("references large text snapshots and explicitly falls back for binary or oversized files", async () => {
+			const largePath = path.join(testDir, "large-write.txt");
+			const largeText = "x".repeat(MAX_EDIT_SNAPSHOT_TEXT_CHARS);
+			fs.writeFileSync(largePath, largeText);
 
-			const oversizedResult = await writeTool.execute("test-call-write-oversized", {
-				path: oversizedPath,
+			const largeResult = await writeTool.execute("test-call-write-large", {
+				path: largePath,
 				content: "small replacement",
 			});
-			expect(oversizedResult.details).toMatchObject({ snapshotsPruned: true });
-			expect(oversizedResult.details?.oldText).toBeUndefined();
-			expect(oversizedResult.details?.newText).toBeUndefined();
+			const oldRef = largeResult.details?.oldSnapshotRef;
+			const newRef = largeResult.details?.newSnapshotRef;
+			if (!oldRef || !newRef) throw new Error("Expected large write snapshot references");
+			expect(largeResult.details?.snapshotsPruned).toBeUndefined();
+			expect(getEditStore(session).byHashText(oldRef.path, oldRef.versionId)).toBe(largeText);
+			expect(getEditStore(session).byHashText(newRef.path, newRef.versionId)).toBe("small replacement");
 
 			const binaryPath = path.join(testDir, "binary-write.dat");
 			fs.writeFileSync(binaryPath, Uint8Array.from([0, 0xff, 0, 0x80]));
-
 			const binaryResult = await writeTool.execute("test-call-write-binary", {
 				path: binaryPath,
 				content: "text replacement",
 			});
-			expect(binaryResult.details).toMatchObject({ snapshotsPruned: true });
+			expect(binaryResult.details).toMatchObject({
+				snapshotsPruned: true,
+				snapshotFallback: "binary",
+			});
 			expect(binaryResult.details?.oldText).toBeUndefined();
 			expect(binaryResult.details?.newText).toBeUndefined();
+
+			const oversizedPath = path.join(testDir, "oversized-write.txt");
+			fs.writeFileSync(oversizedPath, "x".repeat(SNAPSHOT_MAX_BYTES + 1));
+			const oversizedResult = await writeTool.execute("test-call-write-oversized", {
+				path: oversizedPath,
+				content: "text replacement",
+			});
+			expect(oversizedResult.details).toMatchObject({
+				snapshotsPruned: true,
+				snapshotFallback: "file-limit",
+			});
+			expect(oversizedResult.details?.oldText).toBeUndefined();
+			expect(oversizedResult.details?.newText).toBeUndefined();
+		});
+
+		it("replaces existing binary files without routing them through an ACP text bridge", async () => {
+			const binaryPath = path.join(testDir, "binary-acp-write.dat");
+			fs.writeFileSync(binaryPath, Uint8Array.from([0, 0xff, 0, 0x80]));
+			const bridgeWrite = vi.fn(async () => {
+				throw new Error("ACP client cannot open existing binary content as text");
+			});
+			const bridge: ClientBridge = {
+				capabilities: { writeTextFile: true },
+				writeTextFile: bridgeWrite,
+			};
+			const binarySession = createTestToolSession(testDir, Settings.isolated(), {
+				enableLsp: false,
+				getClientBridge: () => bridge,
+			});
+			const binaryWriteTool = new WriteTool(binarySession);
+
+			const result = await binaryWriteTool.execute("test-call-write-binary-acp", {
+				path: binaryPath,
+				content: "text replacement",
+			});
+
+			expect(bridgeWrite).not.toHaveBeenCalled();
+			expect(fs.readFileSync(binaryPath, "utf8")).toBe("text replacement");
+			expect(result.details).toMatchObject({
+				snapshotsPruned: true,
+				snapshotFallback: "binary",
+			});
 		});
 
 		it("should create parent directories", async () => {

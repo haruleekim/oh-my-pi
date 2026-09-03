@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getBlobsDir, isRecord, logger } from "@oh-my-pi/pi-utils";
 import type { AgentSideConnection, ClientCapabilities, SessionUpdate, ToolCallStatus } from "@oh-my-pi/pi-utils/acp";
+import { getEditStore } from "../../edit/store";
 import { AgentRegistry } from "../../registry/agent-registry";
 import type {
 	AgentSession,
@@ -493,6 +494,7 @@ export class AcpSubagentBridge {
 				return state.messageProgress;
 			},
 			getToolArgs: toolCallId => state.toolArgsById.get(toolCallId),
+			getFileSnapshot: (path, versionId) => getEditStore(child.session).byHashText(path, versionId) ?? undefined,
 			cwd: child.session.sessionManager.getCwd(),
 			resolveImageData: (data, _mimeType) => resolveImageDataSync(this.#blobs, data),
 		})) {

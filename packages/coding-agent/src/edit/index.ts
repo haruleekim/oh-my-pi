@@ -34,7 +34,10 @@ import {
 import { FileChangeType, notifyWorkspaceWatchedFiles } from "../lsp/client";
 import { DeferredDiagnostics } from "../lsp/deferred-diagnostics";
 import { getDiagnosticsLedger } from "../lsp/diagnostics-ledger";
-import { MAX_EDIT_SNAPSHOT_TEXT_CHARS } from "./snapshot-details";
+import { finalizeFileMutationSnapshots } from "./snapshot-details";
+
+export * from "./snapshot-details";
+export * from "./store";
 import type { ToolSession } from "../tools";
 import { routeWriteThroughBridge } from "../tools/acp-bridge";
 import { truncateForPrompt } from "../tools/approval";
@@ -253,31 +256,8 @@ function aggregateDetails(files: readonly EditFileOutcome[], mode: EditMode): Ed
 			.filter(Boolean)
 			.join("\n"),
 		firstChangedLine: perFileResults.find(file => file.firstChangedLine !== undefined)?.firstChangedLine,
-		perFileResults: capPerFileSnapshots(perFileResults),
+		perFileResults,
 	};
-}
-
-/**
- * Combined `oldText` + `newText` character budget shared across a multi-file
- * result. The engine already prunes each file on its own; this keeps a
- * many-small-files batch from accumulating unbounded snapshot bytes in the
- * session JSONL (#3787). Early entries keep their diff visualization; later
- * ones degrade to text-only. The per-result budget itself lives with the
- * TypeScript-side pruning helper so both cannot drift apart.
- */
-
-function capPerFileSnapshots(entries: EditToolPerFileResult[]): EditToolPerFileResult[] {
-	let remaining = MAX_EDIT_SNAPSHOT_TEXT_CHARS;
-	return entries.map(entry => {
-		const kept = (entry.oldText?.length ?? 0) + (entry.newText?.length ?? 0);
-		if (kept === 0) return entry;
-		if (kept <= remaining) {
-			remaining -= kept;
-			return entry;
-		}
-		const { oldText: _old, newText: _new, ...rest } = entry;
-		return { ...rest, snapshotsPruned: true };
-	});
 }
 
 async function mkdirAllowingFallback(directory: string): Promise<void> {
@@ -467,7 +447,11 @@ export class EditTool implements AgentTool<TInput> {
 			return { content: [{ type: "text", text: outcome.text }], isError: true };
 		}
 
-		const details = aggregateDetails(outcome.files, this.mode);
+		// Snapshots the result cannot afford to inline move into the session's
+		// edit store and leave a reference behind, so a live ACP client still
+		// renders a native diff for a large edit instead of losing it.
+		const aggregated = aggregateDetails(outcome.files, this.mode);
+		const details = aggregated ? finalizeFileMutationSnapshots(aggregated, getEditStore(this.session)) : undefined;
 		const result: AgentToolResult<EditToolDetails, TInput> = {
 			content: [{ type: "text", text: outcome.text }],
 			...(details ? { details } : {}),

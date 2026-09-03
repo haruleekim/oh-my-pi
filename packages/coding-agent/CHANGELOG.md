@@ -184,6 +184,7 @@
 ### Fixed
 
 - Active sessions now keep memory proportional to truncated raw SSE and tool outputs instead of retaining complete oversized backing strings ([#10547](https://github.com/can1357/oh-my-pi/issues/10547)).
+- Large text edits now render as native diffs in live ACP clients without duplicate hashline output, while binary and oversized files show explicit fallback reasons.
 - File writes now render as diffs in ACP clients instead of showing only the write summary.
 - Anthropic sessions now keep tool-roster changes and warm-prefix pruning from invalidating preserved thinking or the prompt cache.
 - TypeScript code intelligence now works on TypeScript 7 projects: the built-in `typescript-native` server runs `tsc --lsp --stdio` when the resolved TypeScript install no longer ships `tsserver.js`, replacing `typescript-language-server` for that project.

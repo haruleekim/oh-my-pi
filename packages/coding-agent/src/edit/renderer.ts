@@ -51,6 +51,15 @@ export { getLspBatchRequest, type LspBatchRequest };
 // Tool Details Types
 // ═══════════════════════════════════════════════════════════════════════════
 
+/** Where a live client can fetch a snapshot the result did not inline. */
+export interface FileMutationSnapshotRef {
+	path: string;
+	versionId: string;
+}
+
+/** Why both snapshot sides are missing, when they are. */
+export type FileMutationSnapshotFallback = "binary" | "file-limit" | "evicted" | "unavailable";
+
 export type Operation = "create" | "delete" | "update";
 
 export interface PerFileDiffPreview {
@@ -81,8 +90,11 @@ export interface EditToolPerFileResult {
 	oldText?: string;
 	/** Source-of-truth content after the edit; `undefined` for delete operations. */
 	newText?: string;
-	/** True when {@link pruneOversizedEditSnapshots} dropped `oldText`/`newText` from this entry. Aggregators check this to suppress misleading combined snapshots when at least one entry of a multi-entry single-path edit was pruned. */
+	/** True when full snapshots are unavailable; ACP clients must use the structured fallback reason. */
 	snapshotsPruned?: boolean;
+	oldSnapshotRef?: FileMutationSnapshotRef;
+	newSnapshotRef?: FileMutationSnapshotRef;
+	snapshotFallback?: FileMutationSnapshotFallback;
 	/** Pre-move source path; set only when the edit moved/renamed the file. The header renders `sourcePath → path`. */
 	sourcePath?: string;
 }
@@ -108,8 +120,11 @@ export interface EditToolDetails {
 	oldText?: string;
 	/** Source-of-truth content after the edit; `undefined` for delete operations. */
 	newText?: string;
-	/** True when {@link pruneOversizedEditSnapshots} dropped `oldText`/`newText` from this entry. Aggregators check this to suppress misleading combined snapshots when at least one entry of a multi-entry single-path edit was pruned. */
+	/** True when full snapshots are unavailable; ACP clients must use the structured fallback reason. */
 	snapshotsPruned?: boolean;
+	oldSnapshotRef?: FileMutationSnapshotRef;
+	newSnapshotRef?: FileMutationSnapshotRef;
+	snapshotFallback?: FileMutationSnapshotFallback;
 	/** Pre-move source path; set only when the edit moved/renamed the file. The header renders `sourcePath → path`. */
 	sourcePath?: string;
 }

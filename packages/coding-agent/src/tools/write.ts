@@ -22,7 +22,7 @@ import {
 } from "@oh-my-pi/pi-utils/ar";
 import { getEditStore } from "../edit/store";
 import { normalizeToLF } from "../edit/normalize";
-import { MAX_EDIT_SNAPSHOT_TEXT_CHARS, pruneOversizedSnapshot } from "../edit/snapshot-details";
+import { finalizeFileMutationSnapshots, SNAPSHOT_MAX_BYTES, type SnapshotDetails } from "../edit/snapshot-details";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { InternalUrlRouter } from "../internal-urls";
 import { parseInternalUrl } from "../internal-urls/parse";
@@ -312,7 +312,7 @@ const writeSchema = type({
 export type WriteToolInput = typeof writeSchema.infer;
 
 /** Details returned by the write tool for TUI rendering */
-export interface WriteToolDetails {
+export interface WriteToolDetails extends SnapshotDetails {
 	diagnostics?: FileDiagnosticsResult;
 	meta?: OutputMeta;
 	/** Set when the file was auto-chmod'd because content begins with a `#!` shebang. */
@@ -320,14 +320,7 @@ export interface WriteToolDetails {
 	/** Absolute filesystem path the write resolved to. Used by the renderer to wrap
 	 * the (possibly cwd-relative) header path in an OSC 8 `file://` hyperlink. */
 	resolvedPath?: string;
-	/** Absolute filesystem path used by ACP diff consumers. */
-	path?: string;
-	/** Source-of-truth content before the write; absent for a newly-created file. */
-	oldText?: string;
-	/** Source-of-truth content after the write. */
-	newText?: string;
-	/** Set when the pre/post snapshots exceeded the persisted-details budget. */
-	snapshotsPruned?: boolean;
+	notices?: string[];
 	/** Set when the write dispatched an `xd://` tool device; drives renderer delegation. */
 	xdev?: XdevDispatch;
 }
@@ -1301,18 +1294,22 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 
 			const destination = Bun.file(absolutePath);
 			let oldText: string | undefined;
-			let snapshotsPruned = cleanContent.length > MAX_EDIT_SNAPSHOT_TEXT_CHARS;
+			let bypassTextBridge = false;
+			let snapshotFallback: WriteToolDetails["snapshotFallback"] =
+				Buffer.byteLength(cleanContent) > SNAPSHOT_MAX_BYTES ? "file-limit" : undefined;
 			try {
 				const stat = await destination.stat();
 				await assertEditableFile(absolutePath, path, this.session.settings);
-				if (
-					!snapshotsPruned &&
-					(stat.size + cleanContent.length > MAX_EDIT_SNAPSHOT_TEXT_CHARS ||
-						(await isProbablyBinary(absolutePath)))
-				) {
-					snapshotsPruned = true;
+				if (!snapshotFallback) {
+					if (stat.size > SNAPSHOT_MAX_BYTES) {
+						snapshotFallback = "file-limit";
+					} else if (await isProbablyBinary(absolutePath)) {
+						snapshotFallback = "binary";
+						bypassTextBridge = true;
+					} else {
+						oldText = await destination.text();
+					}
 				}
-				if (!snapshotsPruned) oldText = await destination.text();
 			} catch (error) {
 				if (!isEnoent(error)) throw error;
 			}
@@ -1322,7 +1319,9 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 
 			// Try ACP bridge first for editor-visible filesystem paths. Internal
 			// artifacts such as local:// plans are owned by OMP, not the editor.
-			const bridgeWrite = await routeWriteThroughBridge(this.session, path, absolutePath, cleanContent, signal);
+			const bridgeWrite = bypassTextBridge
+				? undefined
+				: await routeWriteThroughBridge(this.session, path, absolutePath, cleanContent, signal);
 			if (bridgeWrite) {
 				// `write` always replaces the whole file, so (unlike hashline's
 				// hunk-scoped diff) there's no size cost to keying the header/
@@ -1339,14 +1338,22 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				if (madeExecutable) {
 					resultText += `\n${EXECUTABLE_NOTICE}`;
 				}
-				const details = pruneOversizedSnapshot<WriteToolDetails>({
-					resolvedPath: absolutePath,
-					path: absolutePath,
-					...(snapshotsPruned
-						? { snapshotsPruned: true }
-						: { ...(oldText === undefined ? {} : { oldText }), newText: bridgeWrite.text }),
-					...(madeExecutable ? { madeExecutable: true } : {}),
-				});
+				const notices = [
+					...(stripped ? ["Note: auto-stripped hashline display prefixes from content before writing."] : []),
+					...(madeExecutable ? [EXECUTABLE_NOTICE] : []),
+				];
+				const details = finalizeFileMutationSnapshots<WriteToolDetails>(
+					{
+						resolvedPath: absolutePath,
+						path: absolutePath,
+						...(snapshotFallback
+							? { snapshotsPruned: true, snapshotFallback }
+							: { ...(oldText === undefined ? {} : { oldText }), newText: bridgeWrite.text }),
+						...(madeExecutable ? { madeExecutable: true } : {}),
+						...(notices.length > 0 ? { notices } : {}),
+					},
+					getEditStore(this.session),
+				);
 				return {
 					content: [{ type: "text", text: resultText }],
 					details,
@@ -1362,10 +1369,10 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				dst => this.#deferredDiagnostics?.begin(dst),
 			);
 			let newText: string | undefined;
-			if (!snapshotsPruned) {
+			if (!snapshotFallback) {
 				const stat = await destination.stat();
-				if ((oldText?.length ?? 0) + stat.size > MAX_EDIT_SNAPSHOT_TEXT_CHARS) {
-					snapshotsPruned = true;
+				if (stat.size > SNAPSHOT_MAX_BYTES) {
+					snapshotFallback = "file-limit";
 				} else {
 					newText = await destination.text();
 				}
@@ -1385,22 +1392,34 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			if (madeExecutable) {
 				resultText += `\n${EXECUTABLE_NOTICE}`;
 			}
-			const details = pruneOversizedSnapshot<WriteToolDetails>({
-				resolvedPath: absolutePath,
-				path: absolutePath,
-				...(snapshotsPruned || newText === undefined
-					? { snapshotsPruned: true }
-					: { ...(oldText === undefined ? {} : { oldText }), newText }),
-				...(madeExecutable ? { madeExecutable: true } : {}),
-				...(diagnostics
-					? {
-							diagnostics,
-							meta: outputMeta()
-								.diagnostics(diagnostics.summary, diagnostics.messages ?? [])
-								.get(),
-						}
-					: {}),
-			});
+			const notices = [
+				...(stripped ? ["Note: auto-stripped hashline display prefixes from content before writing."] : []),
+				...(madeExecutable ? [EXECUTABLE_NOTICE] : []),
+				...(diagnostics?.messages ?? []),
+			];
+			const details = finalizeFileMutationSnapshots<WriteToolDetails>(
+				{
+					resolvedPath: absolutePath,
+					path: absolutePath,
+					...(snapshotFallback || newText === undefined
+						? {
+								snapshotsPruned: true,
+								snapshotFallback: snapshotFallback ?? "unavailable",
+							}
+						: { ...(oldText === undefined ? {} : { oldText }), newText }),
+					...(madeExecutable ? { madeExecutable: true } : {}),
+					...(diagnostics
+						? {
+								diagnostics,
+								meta: outputMeta()
+									.diagnostics(diagnostics.summary, diagnostics.messages ?? [])
+									.get(),
+							}
+						: {}),
+					...(notices.length > 0 ? { notices } : {}),
+				},
+				getEditStore(this.session),
+			);
 			return {
 				content: [{ type: "text", text: resultText }],
 				details,
