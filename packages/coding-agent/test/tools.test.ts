@@ -8,7 +8,7 @@ import type { AgentTool, AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { DEFAULT_BASH_INTERCEPTOR_RULES, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { EditTool } from "@oh-my-pi/pi-coding-agent/edit";
+import { EditTool, MAX_EDIT_SNAPSHOT_TEXT_CHARS } from "@oh-my-pi/pi-coding-agent/edit";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
@@ -1871,6 +1871,30 @@ describe("Coding Agent Tools", () => {
 				oldText: initialContent,
 				newText: replacementContent,
 			});
+		});
+
+		it("prunes oversized and binary ACP write snapshots", async () => {
+			const oversizedPath = path.join(testDir, "oversized-write.txt");
+			fs.writeFileSync(oversizedPath, "x".repeat(MAX_EDIT_SNAPSHOT_TEXT_CHARS));
+
+			const oversizedResult = await writeTool.execute("test-call-write-oversized", {
+				path: oversizedPath,
+				content: "small replacement",
+			});
+			expect(oversizedResult.details).toMatchObject({ snapshotsPruned: true });
+			expect(oversizedResult.details?.oldText).toBeUndefined();
+			expect(oversizedResult.details?.newText).toBeUndefined();
+
+			const binaryPath = path.join(testDir, "binary-write.dat");
+			fs.writeFileSync(binaryPath, Uint8Array.from([0, 0xff, 0, 0x80]));
+
+			const binaryResult = await writeTool.execute("test-call-write-binary", {
+				path: binaryPath,
+				content: "text replacement",
+			});
+			expect(binaryResult.details).toMatchObject({ snapshotsPruned: true });
+			expect(binaryResult.details?.oldText).toBeUndefined();
+			expect(binaryResult.details?.newText).toBeUndefined();
 		});
 
 		it("should create parent directories", async () => {

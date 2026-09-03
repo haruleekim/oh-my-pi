@@ -11,7 +11,7 @@ import type {
 	ToolApprovalDecision,
 } from "@oh-my-pi/pi-agent-core";
 import { type Component, Text } from "@oh-my-pi/pi-tui";
-import { isEnoent, isRecord, prompt, untilAborted } from "@oh-my-pi/pi-utils";
+import { isEnoent, isProbablyBinary, isRecord, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import {
 	type ArchiveMemberContent,
 	archiveFormatFromPath,
@@ -22,7 +22,7 @@ import {
 } from "@oh-my-pi/pi-utils/ar";
 import { getEditStore } from "../edit/store";
 import { normalizeToLF } from "../edit/normalize";
-import { pruneOversizedSnapshot } from "../edit/snapshot-details";
+import { MAX_EDIT_SNAPSHOT_TEXT_CHARS, pruneOversizedSnapshot } from "../edit/snapshot-details";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { InternalUrlRouter } from "../internal-urls";
 import { parseInternalUrl } from "../internal-urls/parse";
@@ -1301,9 +1301,18 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 
 			const destination = Bun.file(absolutePath);
 			let oldText: string | undefined;
+			let snapshotsPruned = cleanContent.length > MAX_EDIT_SNAPSHOT_TEXT_CHARS;
 			try {
-				oldText = await destination.text();
+				const stat = await destination.stat();
 				await assertEditableFile(absolutePath, path, this.session.settings);
+				if (
+					!snapshotsPruned &&
+					(stat.size + cleanContent.length > MAX_EDIT_SNAPSHOT_TEXT_CHARS ||
+						(await isProbablyBinary(absolutePath)))
+				) {
+					snapshotsPruned = true;
+				}
+				if (!snapshotsPruned) oldText = await destination.text();
 			} catch (error) {
 				if (!isEnoent(error)) throw error;
 			}
@@ -1333,8 +1342,9 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				const details = pruneOversizedSnapshot<WriteToolDetails>({
 					resolvedPath: absolutePath,
 					path: absolutePath,
-					...(oldText === undefined ? {} : { oldText }),
-					newText: bridgeWrite.text,
+					...(snapshotsPruned
+						? { snapshotsPruned: true }
+						: { ...(oldText === undefined ? {} : { oldText }), newText: bridgeWrite.text }),
 					...(madeExecutable ? { madeExecutable: true } : {}),
 				});
 				return {
@@ -1351,7 +1361,15 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				batchRequest,
 				dst => this.#deferredDiagnostics?.begin(dst),
 			);
-			const newText = await destination.text();
+			let newText: string | undefined;
+			if (!snapshotsPruned) {
+				const stat = await destination.stat();
+				if ((oldText?.length ?? 0) + stat.size > MAX_EDIT_SNAPSHOT_TEXT_CHARS) {
+					snapshotsPruned = true;
+				} else {
+					newText = await destination.text();
+				}
+			}
 			invalidateFsScanAfterWrite(absolutePath);
 			if (!this.#deferredDiagnostics || batchRequest?.flush === false) {
 				this.session.bumpFileMutationVersion?.(absolutePath);
@@ -1370,8 +1388,9 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			const details = pruneOversizedSnapshot<WriteToolDetails>({
 				resolvedPath: absolutePath,
 				path: absolutePath,
-				...(oldText === undefined ? {} : { oldText }),
-				newText,
+				...(snapshotsPruned || newText === undefined
+					? { snapshotsPruned: true }
+					: { ...(oldText === undefined ? {} : { oldText }), newText }),
 				...(madeExecutable ? { madeExecutable: true } : {}),
 				...(diagnostics
 					? {
