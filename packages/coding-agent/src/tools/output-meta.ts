@@ -50,6 +50,7 @@ export interface TruncationMeta {
 	 * size; renders a distinct "partial" notice instead of a line range.
 	 */
 	partialLine?: boolean;
+	/**
 	 * The captured stream was ALREADY incomplete before this result was
 	 * assembled — e.g. an ACP client terminal dropped bytes past its own
 	 * buffer limit, so nothing downstream ever saw them. An artifact of this

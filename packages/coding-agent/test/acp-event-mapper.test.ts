@@ -398,14 +398,17 @@ describe("ACP event mapper", () => {
 		expect(updates).toEqual([]);
 	});
 
-	it("uses command text for a new command tool even when intent is generic", () => {
+	it("prefers the model's intent over the command for a command tool", () => {
+		// `i` is required by default and the system prompt shapes it into a short
+		// present-participle phrase, so it is a better card name than the source
+		// the client already renders below.
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
 				type: "tool_execution_start",
-				toolCallId: "tc-command-start-generic-intent",
+				toolCallId: "tc-command-start-intent",
 				toolName: "bash",
 				args: { command: "echo hi" },
-				intent: "Running command",
+				intent: "Checking greeting output",
 			} as AgentSessionEvent,
 			"session-1",
 		);
@@ -416,8 +419,32 @@ describe("ACP event mapper", () => {
 			title: string;
 			content?: Array<{ type: string; content?: { type: string; text?: string } }>;
 		};
-		expect(update.title).toBe("$ echo hi");
-		expect(update.content).toContainEqual(shellResourceContent("tc-command-start-generic-intent", "echo hi"));
+		expect(update.title).toBe("Checking greeting output");
+		// The command is still shipped once, as highlighted source.
+		expect(update.content).toContainEqual(shellResourceContent("tc-command-start-intent", "echo hi"));
+	});
+
+	it("names a shell call by its invocation head, not the whole command", () => {
+		// The full command rides along as highlighted source, so the title's one
+		// line should say what ran — an inline script pasted verbatim used to
+		// wrap over the entire card.
+		const cases: Array<{ command: string; title: string }> = [
+			{ command: 'bun -e "console.log(JSON.stringify({ a: 1 }))"', title: "bun -e" },
+			{ command: "npm test", title: "npm test" },
+			{ command: 'git commit -m "msg"', title: "git commit" },
+			{ command: "NODE_ENV=production bun run build", title: "bun run build" },
+			{ command: "for i in $(seq 1 5); do echo $i; done", title: "for i in" },
+			{ command: "ls", title: "ls" },
+		];
+		for (const { command, title } of cases) {
+			const update = buildToolCallStartUpdate({
+				toolCallId: "tc-command-label",
+				toolName: "bash",
+				args: { command },
+				cwd: path.resolve("/repo"),
+			});
+			expect(update).toMatchObject({ title });
+		}
 	});
 
 	it("emits language-tagged resources for eval sources", () => {
@@ -582,44 +609,41 @@ describe("ACP event mapper", () => {
 		}
 	});
 
-	it("caps command titles without truncating shell resource source", () => {
-		for (const [commandLength, titleEndsWithEllipsis] of [
-			[3_998, false],
-			[3_999, true],
-		] as const) {
-			const command = "c".repeat(commandLength);
-			const toolCallId = `tc-command-title-${commandLength}`;
-			const update = buildToolCallStartUpdate({
-				toolCallId,
-				toolName: "bash",
-				args: { command },
-			}) as {
-				title: string;
-				content?: Array<{
+	it("keeps an unnameable command's title short while the shell resource stays whole", () => {
+		// One giant token has no invocation head to name; the title must not
+		// become a wall of text, and the source block must still carry every byte.
+		const command = "c".repeat(3_998);
+		const toolCallId = "tc-command-title-long";
+		const update = buildToolCallStartUpdate({
+			toolCallId,
+			toolName: "bash",
+			args: { command },
+		}) as {
+			title: string;
+			content?: Array<{
+				type: string;
+				content?: {
 					type: string;
-					content?: {
-						type: string;
-						resource?: { uri: string; text: string; mimeType?: string };
-					};
-				}>;
-			};
+					resource?: { uri: string; text: string; mimeType?: string };
+				};
+			}>;
+		};
 
-			expect(update.title).toHaveLength(4_000);
-			expect(update.title.endsWith("…")).toBe(titleEndsWithEllipsis);
-			expect(update.content).toEqual([
-				{
-					type: "content",
-					content: {
-						type: "resource",
-						resource: {
-							uri: `omp-shell://tool/${toolCallId}/command.sh`,
-							text: command,
-							mimeType: "text/x-shellscript",
-						},
+		expect(update.title.length).toBeLessThanOrEqual(64);
+		expect(update.title.endsWith("…")).toBe(true);
+		expect(update.content).toEqual([
+			{
+				type: "content",
+				content: {
+					type: "resource",
+					resource: {
+						uri: `omp-shell://tool/${toolCallId}/command.sh`,
+						text: command,
+						mimeType: "text/x-shellscript",
 					},
 				},
-			]);
-		}
+			},
+		]);
 	});
 
 	it("emits a diff ToolCallContent for each per-file edit result", () => {
@@ -1226,7 +1250,7 @@ describe("ACP event mapper", () => {
 		};
 		expect(update.sessionUpdate).toBe("tool_call");
 		expect(update.toolCallId).toBe("toolu_bash_1");
-		expect(update.title).toBe("$ npm run check");
+		expect(update.title).toBe("npm run check");
 		expect(update.kind).toBe("execute");
 		expect(update.status).toBe("pending");
 		expect(update.rawInput).toEqual({ command: "npm run check", cwd: "/repo" });
@@ -1254,7 +1278,7 @@ describe("ACP event mapper", () => {
 				content?: unknown;
 			};
 			expect(update.sessionUpdate).toBe("tool_call");
-			expect(update.title).toBe("$ echo hi");
+			expect(update.title).toBe("echo hi");
 			expect(update.kind).toBe("execute");
 			expect(update.content).toEqual([shellResourceContent(`toolu_${toolName}_1`, "echo hi")]);
 		}
@@ -1357,7 +1381,7 @@ describe("ACP event mapper", () => {
 		expect(update).toMatchObject({
 			sessionUpdate: "tool_call",
 			toolCallId: "toolu_replay_1",
-			title: "$ npm test",
+			title: "npm test",
 			kind: "execute",
 			status: "completed",
 			rawInput: { command: "npm test", cwd: "/repo" },
@@ -1428,11 +1452,44 @@ describe("ACP event mapper", () => {
 		expect(replayArgs.args).toBe(rawArgs);
 		expectAcpStructure(arkSessionNotification, { sessionId: "session-1", update });
 		expect(update).toMatchObject({
-			title: "$ bun test",
+			title: "bun test",
 			status: "completed",
 			rawInput: rawArgs,
 			content: [shellResourceContent("toolu_replay_object", "bun test")],
 		});
+	});
+
+	it("recovers the recorded intent when replaying a tool call", () => {
+		// A live call carries `i` as `event.intent` because the harness strips it
+		// from args before execution, but a replayed call is rebuilt from the
+		// persisted assistant message whose `arguments` still hold the raw `i`.
+		// Without reading it there, reopening a session silently renamed every
+		// card from the model's phrase to the derived label.
+		const rawArgs = { i: "Verifying split edits", command: "bun -e 'x'", cwd: "/repo" };
+		const replayed = buildToolCallStartUpdate({
+			toolCallId: "toolu_replay_intent",
+			toolName: "bash",
+			args: normalizeReplayToolArguments(rawArgs).args,
+			status: "completed",
+		});
+		expectAcpStructure(arkSessionNotification, { sessionId: "session-1", update: replayed });
+		expect(replayed).toMatchObject({ title: "Verifying split edits" });
+
+		// Live delivery still wins with the event's own intent, and args without
+		// `i` keep falling back to the derived label.
+		const live = buildToolCallStartUpdate({
+			toolCallId: "toolu_live_intent",
+			toolName: "bash",
+			args: { command: "bun -e 'x'" },
+			intent: "Checking greeting output",
+		});
+		expect(live).toMatchObject({ title: "Checking greeting output" });
+		const unnamed = buildToolCallStartUpdate({
+			toolCallId: "toolu_no_intent",
+			toolName: "bash",
+			args: { command: "bun -e 'x'" },
+		});
+		expect(unnamed).toMatchObject({ title: "bun -e" });
 	});
 	it("does not add command text content to non-command tool starts", () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
@@ -1655,6 +1712,81 @@ describe("ACP event mapper", () => {
 			title: "write: src/foo.ts",
 			kind: "edit",
 			locations: [{ path: path.resolve("/repo", "src/foo.ts") }],
+		});
+	});
+
+	it("names the files an edit targets instead of the bare tool name", () => {
+		// Hashline buries its targets in `[path#TAG]` section headers, so a card
+		// with no injected `i` intent used to read as just "edit" — and carried
+		// no location until the result landed.
+		const single = buildToolCallStartUpdate({
+			toolCallId: "toolu_edit_one",
+			toolName: "edit",
+			args: { input: "[src/app.ts#4EC2]\nPUT 1.=1:\n+const a = 1;\n" },
+			cwd: path.resolve("/repo"),
+		});
+		expectAcpStructure(arkSessionNotification, { sessionId: "session-1", update: single });
+		expect(single).toMatchObject({
+			title: "edit: src/app.ts",
+			kind: "edit",
+			locations: [{ path: path.resolve("/repo", "src/app.ts") }],
+		});
+
+		const multi = buildToolCallStartUpdate({
+			toolCallId: "toolu_edit_many",
+			toolName: "edit",
+			args: {
+				input: "[src/app.ts#4EC2]\nPUT 1.=1:\n+a\n[src/util.ts#1A2B]\nPUT 2.=2:\n+b\n",
+			},
+			cwd: path.resolve("/repo"),
+		});
+		expect(multi).toMatchObject({
+			title: "edit: src/app.ts (+1 more)",
+			locations: [{ path: path.resolve("/repo", "src/app.ts") }, { path: path.resolve("/repo", "src/util.ts") }],
+		});
+	});
+
+	it("names the target for tools whose subject is not a path argument", () => {
+		const cases: Array<{ toolName: string; args: unknown; title: string }> = [
+			{
+				toolName: "ast_edit",
+				args: { ops: [{ pat: "a", out: "b" }], paths: ["src/app.ts", "src/util.ts"] },
+				title: "ast_edit: src/app.ts (+1 more)",
+			},
+			{ toolName: "ast_grep", args: { pat: "foo($$$A)", path: "src" }, title: "ast_grep: foo($$$A)" },
+			{
+				toolName: "lsp",
+				args: { action: "references", symbol: "alpha", file: "src/app.ts" },
+				title: "lsp: references alpha",
+			},
+			{ toolName: "hub", args: { op: "send", to: "Scout" }, title: "hub: send Scout" },
+			{ toolName: "todo", args: { op: "done", task: "ship it" }, title: "todo: done" },
+			{ toolName: "task", args: { tasks: [{ name: "Alpha" }, { name: "Beta" }] }, title: "task: Alpha (+1 more)" },
+		];
+		for (const { toolName, args, title } of cases) {
+			const update = buildToolCallStartUpdate({
+				toolCallId: `toolu_${toolName}`,
+				toolName,
+				args,
+				cwd: path.resolve("/repo"),
+			});
+			expect(update).toMatchObject({ title });
+		}
+	});
+
+	it("keeps the model's own intent as the card title when it is present", () => {
+		// The target only fills the gap left by an absent `i`; an intent the
+		// model wrote is a better one-line summary and must still win.
+		const update = buildToolCallStartUpdate({
+			toolCallId: "toolu_edit_intent",
+			toolName: "edit",
+			args: { input: "[src/app.ts#4EC2]\nPUT 1.=1:\n+const a = 1;\n" },
+			intent: "Renaming the helper",
+			cwd: path.resolve("/repo"),
+		});
+		expect(update).toMatchObject({
+			title: "Renaming the helper",
+			locations: [{ path: path.resolve("/repo", "src/app.ts") }],
 		});
 	});
 

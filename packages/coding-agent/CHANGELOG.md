@@ -25,6 +25,8 @@
 
 - Eval and shell source sent to ACP clients now carries language metadata, enabling syntax highlighting in supporting editors.
 - ACP plan approval now renders the complete plan as Markdown in supporting clients and uses explicit approve/refine permission choices.
+- ACP tool cards are now named by what the call does: the model's intent when it sent one (recovered from the recorded arguments when a session is reopened), otherwise the target — the files an `edit` touches, an `ast_grep` pattern, an `lsp` action, a `hub` op — instead of the bare tool name or a pasted command.
+- `edit` and `ast_edit` now report their target files to ACP clients as tool-call locations while the call streams, so the editor can open them before the result lands.
 
 ### Fixed
 

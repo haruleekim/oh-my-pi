@@ -9,6 +9,7 @@ import type {
 	ToolKind,
 } from "@oh-my-pi/pi-utils/acp";
 import { parseXdUrl } from "../../internal-urls/xd-protocol";
+import { editTargetPaths } from "../../edit/target-paths";
 import type { AgentSessionEvent } from "../../session/agent-session";
 import { shellSourceToolCallContent } from "../../session/acp-tool-content";
 import { resolveToCwd, splitPathAndSel, splitPathAndSelPreferringLiteralSync } from "../../tools/path-utils";
@@ -110,6 +111,51 @@ interface PatternContainer {
 
 interface QueryContainer {
 	query?: unknown;
+}
+
+/** Recorded tool arguments still carry the raw intent field on replay. */
+interface IntentContainer {
+	i?: unknown;
+}
+
+interface AstPatternContainer {
+	pat?: unknown;
+}
+
+interface OpContainer {
+	op?: unknown;
+}
+
+interface ActionContainer {
+	action?: unknown;
+}
+
+interface FileContainer {
+	file?: unknown;
+}
+
+interface SymbolContainer {
+	symbol?: unknown;
+}
+
+interface NameContainer {
+	name?: unknown;
+}
+
+interface ToContainer {
+	to?: unknown;
+}
+
+interface PathsContainer {
+	paths?: unknown;
+}
+
+interface TasksContainer {
+	tasks?: unknown;
+}
+
+interface AgentContainer {
+	agent?: unknown;
 }
 
 interface ErrorMessageContainer {
@@ -585,9 +631,47 @@ function buildToolStartContent(
 	return pinned && pinned.length > 0 ? [...pinned, ...startContent] : startContent;
 }
 
+/** Shell metacharacters and quoting end the label: past them a token is data, not a name. */
+const COMMAND_LABEL_STOP = /["'`$(){}[\]|&;<>]|^--?$/;
+const COMMAND_LABEL_MAX_TOKENS = 3;
+const COMMAND_LABEL_MAX_TOKEN_CHARS = 24;
+/** Cap for the no-recognizable-head fallback: the full command is in the source block. */
+const COMMAND_LABEL_FALLBACK_MAX_CHARS = 64;
+
+/**
+ * Name a shell call by its invocation head — `bun -e`, `npm test`,
+ * `git commit` — instead of pasting the whole command into the card title.
+ *
+ * The client already renders the full command as syntax-highlighted source
+ * right below the title, so repeating it there wastes the one line a card has
+ * for saying *what* ran. Leading `VAR=value` assignments are skipped (they
+ * describe the environment, not the program), and the label stops at the first
+ * quoted or metacharacter-bearing token, which is where arguments begin.
+ */
+function summarizeCommandLabel(command: string): string | undefined {
+	const tokens = command.trim().split(/\s+/);
+	const label: string[] = [];
+	for (const token of tokens) {
+		if (label.length === 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) continue;
+		if (COMMAND_LABEL_STOP.test(token) || token.length > COMMAND_LABEL_MAX_TOKEN_CHARS) break;
+		label.push(token);
+		if (label.length === COMMAND_LABEL_MAX_TOKENS) break;
+	}
+	// A flag right after the program names the mode (`bun -e`, `sed -n`) and
+	// stays; one trailing a subcommand is a cut-off option whose value we just
+	// dropped (`git commit -m`, `cargo test -p`), so it reads better without it.
+	if (label.length === COMMAND_LABEL_MAX_TOKENS && label[label.length - 1]?.startsWith("-")) label.pop();
+	if (label.length > 0) return label.join(" ");
+	// No recognizable head (a one-liner that opens with a quote or a subshell,
+	// or one giant token): name it with a short prefix rather than a wall of
+	// text, since the untruncated command rides along as source.
+	const trimmed = command.trim();
+	return trimmed ? truncate(trimmed, COMMAND_LABEL_FALLBACK_MAX_CHARS) : undefined;
+}
+
 function buildCommandTitle(args: unknown): string | undefined {
 	const command = extractStringProperty<CommandContainer>(args, "command");
-	return command ? `$ ${command}` : undefined;
+	return command ? summarizeCommandLabel(command) : undefined;
 }
 
 function buildCommandStartContent(toolCallId: string, args: unknown): ToolCallContent[] {
@@ -687,17 +771,99 @@ function isFileMutationToolName(toolName: string): boolean {
 	return toolName === "edit" || toolName === "write";
 }
 
-function buildToolTitle(toolName: string, args: unknown, intent: string | undefined): string {
-	let title: string | undefined;
-	if (isCommandToolName(toolName)) {
-		title = buildCommandTitle(args);
-	} else if (toolName === "eval") {
-		title = buildEvalTitle(args);
+/** `"a.ts"` → `a.ts`; `["a.ts","b.ts"]` → `a.ts (+1 more)`. */
+function formatSubjectList(values: readonly string[]): string | undefined {
+	const [first, ...rest] = values;
+	if (!first) return undefined;
+	return rest.length > 0 ? `${first} (+${rest.length} more)` : first;
+}
+
+function extractStringList(args: unknown, key: "paths"): string[] {
+	if (typeof args !== "object" || args === null) return [];
+	const value = (args as PathsContainer)[key];
+	if (!Array.isArray(value)) return [];
+	return value.filter((entry): entry is string => typeof entry === "string" && entry.length > 0);
+}
+
+function extractTaskNames(args: unknown): string[] {
+	if (typeof args !== "object" || args === null) return [];
+	const tasks = (args as TasksContainer).tasks;
+	if (!Array.isArray(tasks)) return [];
+	const names: string[] = [];
+	for (const task of tasks) {
+		const name =
+			extractStringProperty<NameContainer>(task, "name") ?? extractStringProperty<AgentContainer>(task, "agent");
+		if (name) names.push(name);
 	}
-	title ??= intent?.trim() || undefined;
+	return names;
+}
+
+/**
+ * The thing a tool call acts on, for tools whose target is not a plain `path`
+ * argument. Without this a card reads as the bare tool name (`edit`, `hub`,
+ * `lsp`) and the operator cannot tell which file or operation it was — the
+ * fallback matters because `i` intent injection is optional and off in plenty
+ * of sessions.
+ */
+function buildToolSubject(toolName: string, args: unknown): string | undefined {
+	switch (toolName) {
+		case "edit":
+			// Hashline/apply_patch/sloppy bury their targets in the payload.
+			return formatSubjectList(editTargetPaths(args));
+		case "ast_edit":
+			return formatSubjectList(extractStringList(args, "paths"));
+		case "ast_grep":
+			return extractStringProperty<AstPatternContainer>(args, "pat");
+		case "lsp": {
+			const action = extractStringProperty<ActionContainer>(args, "action");
+			const target =
+				extractStringProperty<SymbolContainer>(args, "symbol") ??
+				extractStringProperty<FileContainer>(args, "file") ??
+				extractStringProperty<QueryContainer>(args, "query");
+			if (!action) return target;
+			return target ? `${action} ${target}` : action;
+		}
+		case "hub": {
+			const op = extractStringProperty<OpContainer>(args, "op");
+			const target =
+				extractStringProperty<ToContainer>(args, "to") ?? extractStringProperty<NameContainer>(args, "name");
+			if (!op) return target;
+			return target ? `${op} ${target}` : op;
+		}
+		case "todo":
+			return extractStringProperty<OpContainer>(args, "op");
+		case "task":
+			return formatSubjectList(extractTaskNames(args));
+		default:
+			return undefined;
+	}
+}
+
+function buildToolTitle(toolName: string, args: unknown, intent: string | undefined): string {
+	// `eval` labels its own cells and the label carries the language
+	// (`[py] load config`) — context an intent phrase cannot express — so it
+	// stays ahead of `i`.
+	let title = toolName === "eval" ? buildEvalTitle(args) : undefined;
+	// Otherwise the model's own `i` is the best one-line name a card can carry:
+	// intent tracing is on by default and the system prompt shapes it into a
+	// short present-participle phrase. Pasting the command over it wasted the
+	// line on source the client already renders below.
+	//
+	// Live events carry it as `event.intent` (the harness strips `i` from args
+	// before execution). Replayed tool calls are rebuilt from the persisted
+	// assistant message, whose recorded `arguments` still hold the raw `i`, so
+	// reading it there keeps a reopened session's titles identical to the live
+	// ones instead of dropping to the derived label.
+	title ??= intent?.trim() || extractStringProperty<IntentContainer>(args, "i")?.trim() || undefined;
+	// Derived label only fills in when `i` is absent (tracing off, or a model
+	// that skipped it).
+	if (!title && isCommandToolName(toolName)) {
+		title = buildCommandTitle(args);
+	}
 
 	if (!title) {
 		const subject =
+			buildToolSubject(toolName, args) ??
 			extractStringProperty<PathContainer>(args, "path") ??
 			extractStringProperty<CommandContainer>(args, "command") ??
 			extractStringProperty<PatternContainer>(args, "pattern") ??
@@ -778,6 +944,14 @@ function extractToolLocations(args: unknown, cwd?: string, toolName?: string): T
 	pushPath(readLocationBasePath(extractStringProperty<PathContainer>(args, "path"), cwd, toolName));
 	pushPath(extractStringProperty<OldPathContainer>(args, "oldPath"));
 	pushPath(extractStringProperty<NewPathContainer>(args, "newPath"));
+	// `edit`/`ast_edit` name their targets inside the payload, so without this
+	// the card carries no location until the result lands and the editor cannot
+	// open the file being changed while it streams.
+	if (toolName === "edit") {
+		for (const path of editTargetPaths(args)) pushPath(path);
+	} else if (toolName === "ast_edit") {
+		for (const path of extractStringList(args, "paths")) pushPath(path);
+	}
 
 	return locations;
 }
