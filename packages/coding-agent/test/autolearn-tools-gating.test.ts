@@ -10,6 +10,7 @@ import type { HindsightSessionState } from "@oh-my-pi/pi-coding-agent/hindsight/
 import type { MnemopiSessionState } from "@oh-my-pi/pi-coding-agent/mnemopi/state";
 import { createTools, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { LearnTool } from "@oh-my-pi/pi-coding-agent/tools/learn";
+import { ToolError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
 import { ManageSkillTool } from "@oh-my-pi/pi-coding-agent/tools/manage-skill";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 import { getAgentDir, setAgentDir } from "@oh-my-pi/pi-utils/dirs";
@@ -228,9 +229,20 @@ describe("learn execute", () => {
 		await removeWithRetries(tempHome);
 	});
 
-	it("stores a lesson to memory without writing a skill when no skill payload", async () => {
-		await new LearnTool(learnSession()).execute("1", { memory: "Prefer Bun.file over readFileSync." });
+	it("rejects blank lessons before writing to the memory backend", async () => {
+		const tool = new LearnTool(learnSession());
+
+		await expect(tool.execute("blank", { memory: " \t\n " })).rejects.toBeInstanceOf(ToolError);
+		await expect(tool.execute("empty", { memory: "" })).rejects.toThrow(/non-empty content/i);
+		expect(remembered).toEqual([]);
+	});
+
+	it("stores a lesson, reports its memory id, and does not write a skill when none is requested", async () => {
+		const result = await new LearnTool(learnSession()).execute("1", {
+			memory: "Prefer Bun.file over readFileSync.",
+		});
 		expect(remembered).toEqual(["Prefer Bun.file over readFileSync."]);
+		expect(result.content[0]).toEqual({ type: "text", text: "Lesson stored (memory id: mem-id)." });
 		// No managed skills written.
 		expect(await fs.readdir(getManagedSkillsDir()).catch(() => [])).toHaveLength(0);
 	});
@@ -250,7 +262,7 @@ describe("learn execute", () => {
 				memory: "lesson",
 				skill: { action: "create", name: "../evil", description: "d", body: "b" },
 			}),
-		).rejects.toThrow(/Lesson stored, but the managed skill could not be written/);
+		).rejects.toThrow(/Lesson stored \(memory id: mem-id\), but the managed skill could not be written/);
 		// The memory half still ran.
 		expect(remembered).toHaveLength(1);
 	});

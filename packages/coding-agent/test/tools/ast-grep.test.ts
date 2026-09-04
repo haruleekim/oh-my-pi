@@ -177,4 +177,63 @@ describe("ast_grep parse errors", () => {
 			await removeWithRetries(tempDir);
 		}
 	});
+
+	it("reports a malformed pattern instead of an indistinguishable no-match", async () => {
+		// `function (` compiles (tree-sitter yields an ERROR node) and then
+		// matches nothing, so a broken query used to look exactly like a
+		// genuine zero-hit search.
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ast-grep-bad-pattern-"));
+		try {
+			const filePath = path.join(tempDir, "sample.ts");
+			await Bun.write(filePath, "export function alpha(x: number) {\n\treturn x + 1;\n}\n");
+			const tools = await createTools(createTestSession(tempDir), ["ast_grep"]);
+			const tool = tools.find(entry => entry.name === "ast_grep");
+			expect(tool).toBeDefined();
+
+			const broken = await tool!.execute("ast-grep-bad-pattern", { pat: "function (", path: filePath });
+			const brokenText = broken.content.find(content => content.type === "text")?.text ?? "";
+			const brokenDetails = broken.details as { parseErrors?: string[]; matchCount?: number } | undefined;
+
+			expect(brokenDetails?.matchCount).toBe(0);
+			expect(brokenText).toContain("Parse issues mean the query may be mis-scoped");
+			expect(brokenDetails?.parseErrors?.join("\n")).toContain("function (");
+			expect(brokenDetails?.parseErrors?.join("\n")).toContain("is an error node for typescript");
+
+			// A well-formed pattern over the same file stays clean: the
+			// diagnostic must not fire on metavariable patterns.
+			const valid = await tool!.execute("ast-grep-good-pattern", {
+				pat: "function $NAME($$$ARGS) { $$$BODY }",
+				path: filePath,
+			});
+			const validDetails = valid.details as { parseErrors?: string[]; matchCount?: number } | undefined;
+			expect(validDetails?.matchCount).toBeGreaterThan(0);
+			expect(validDetails?.parseErrors).toBeUndefined();
+		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
+
+	it("does not flag the JSON fragment patterns the engine deliberately supports", async () => {
+		// `"key": $V` is a MultipleNode fragment that only compiles through the
+		// JSON wrapper fallback, and a bare `$A` is a metavariable with no root
+		// kind. Judging the raw pattern text instead of the compiled pattern
+		// reported both as "can never match" while they were matching fine.
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "ast-grep-json-fragment-"));
+		try {
+			const filePath = path.join(tempDir, "a.json");
+			await Bun.write(filePath, `${JSON.stringify({ key: "value", other: 1 }, null, 2)}\n`);
+			const tools = await createTools(createTestSession(tempDir), ["ast_grep"]);
+			const tool = tools.find(entry => entry.name === "ast_grep");
+			expect(tool).toBeDefined();
+
+			for (const pat of ['"key": $V', "$A"]) {
+				const result = await tool!.execute("ast-grep-json-fragment", { pat, path: filePath, lang: "json" });
+				const details = result.details as { parseErrors?: string[]; matchCount?: number } | undefined;
+				expect(details?.matchCount).toBeGreaterThan(0);
+				expect(details?.parseErrors).toBeUndefined();
+			}
+		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
 });

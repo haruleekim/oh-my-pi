@@ -208,6 +208,13 @@
 - Fixed RPC `prompt` responses for `/skill:*` commands arriving only after the entire prompt-dispatch pipeline finished (usage preflight, compaction, provider calls): under provider stress that outlasts any client prompt timeout, so hosts reported the prompt as rejected while the turn was in fact running. The skill branch now builds the skill prompt eagerly (preserving the immediate error for an unreadable skill file) and dispatches the expensive pipeline asynchronously after answering, matching plain prompts; when the dispatch is cancelled before a turn starts (e.g. an abort overtakes usage preflight), the session now reports it through the non-invoked  completion frame instead of leaving hosts waiting for an  that never comes ([#10249](https://github.com/can1357/oh-my-pi/pull/10249) by [@cwr250](https://github.com/cwr250)).
 - Fixed stale `omp-plugins.lock.json` entries loading leftover `node_modules` trees for plugins no longer declared in an existing `package.json` — the orphaned copy double-loaded its extensions. Lockfile-only plugins remain supported for manifest-less roots and symlinked packages (`omp plugin link`, marketplace runtime packages); stale entries are skipped with a warning.
 
+- `bash` no longer tells the model an artifact holds the full output when the ACP client terminal truncated the capture; the notice now says the stream was truncated before capture and that the missing bytes were never captured.
+- `ast_grep` now reports a malformed pattern (for example `function (`, which tree-sitter accepts as an error node) instead of returning an indistinguishable "No matches found".
+- `read` with the `:raw` selector now discloses binary or lossy UTF-8 decoding, including the file's byte size and how to inspect the original bytes, instead of silently returning replacement characters.
+- `inspect_image` now reports the image's original dimensions and discloses any resize applied before analysis, so dimension questions are no longer answered from the rescaled copy.
+- `hub send` with `await: true` now surfaces a reply that arrived in the same tick as the peer's shutdown instead of reporting "stopped without replying".
+- `learn` now rejects an empty or whitespace-only lesson instead of reporting a stored memory that cannot be recalled, and reports the stored memory's id when the backend returns one.
+- `web_search` now reports when a provider ignored a required `"exact phrase"`, instead of presenting unrelated results as matches.
 ## [18.1.2] - 2026-09-01
 
 ### Added

@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import * as os from "node:os";
 import type { ClientBridge, ClientBridgeTerminalHandle } from "@oh-my-pi/pi-coding-agent/session/client-bridge";
+import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
 import { encodeTerminalImage } from "@oh-my-pi/pi-coding-agent/utils/terminal-graphics";
+import { wrapToolWithMetaNotice } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
 
 function makeSession(bridge: ClientBridge): ToolSession {
 	return {
@@ -379,4 +381,80 @@ describe("BashTool ACP terminal routing", () => {
 		const text = result.content.find(c => c.type === "text");
 		expect(text?.text).toContain("done");
 	}, 8000);
+
+	it("never advertises an artifact as full output when the client terminal truncated the capture", async () => {
+		// Regression: Zed's terminal drops output past its own buffer limit, so
+		// those bytes never reach this process. The result still told the model
+		// `Read artifact://N for full output`, and that artifact was only the
+		// captured prefix — silent data loss presented as complete output.
+		const savedArtifacts: string[] = [];
+		const context = {
+			sessionManager: {
+				saveArtifact: async (text: string) => {
+					savedArtifacts.push(text);
+					return "7";
+				},
+			},
+		} as unknown as AgentToolContext;
+		// A client terminal with a ~50 KB buffer lands between the artifact spill
+		// threshold (50 KB) and bash's own inline cap (threshold + slack), which
+		// is exactly the window where the spill wrapper mints the artifact and
+		// advertises it. 1000 x 52 B = 52,000 B.
+		const captured = `${"OUT-LINE-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n".repeat(1000)}`;
+
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "term-truncated",
+			waitForExit: async () => ({ exitCode: 0, signal: null }),
+			currentOutput: async () => ({ output: captured, truncated: true }),
+			kill: async () => {},
+			release: async () => {},
+		};
+		const bridge: ClientBridge = {
+			capabilities: { terminal: true },
+			createTerminal: async () => handle,
+		};
+
+		const tool = wrapToolWithMetaNotice(new BashTool(makeSession(bridge)));
+		const result = await tool.execute("call-truncated", { command: "seq 6000" }, undefined, undefined, context);
+
+		const text = result.content.find(c => c.type === "text")?.text ?? "";
+		expect(savedArtifacts).toHaveLength(1);
+		expect(text).toContain("artifact://7");
+		expect(text).not.toContain("for full output");
+		expect(text).toContain("the stream was truncated before capture");
+		expect(text).toContain("(output truncated by the client terminal)");
+		expect(result.details?.meta?.truncation?.sourceTruncated).toBe(true);
+	});
+
+	it("still advertises the artifact as full output when the capture was complete", async () => {
+		// Companion to the truncated-capture case: an oversized but COMPLETE
+		// capture is fully recoverable from the artifact, so the honest notice
+		// there is still `for full output`.
+		const context = {
+			sessionManager: {
+				saveArtifact: async () => "8",
+			},
+		} as unknown as AgentToolContext;
+		const captured = `${"OUT-LINE-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n".repeat(1000)}`;
+
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "term-complete",
+			waitForExit: async () => ({ exitCode: 0, signal: null }),
+			currentOutput: async () => ({ output: captured, truncated: false }),
+			kill: async () => {},
+			release: async () => {},
+		};
+		const bridge: ClientBridge = {
+			capabilities: { terminal: true },
+			createTerminal: async () => handle,
+		};
+
+		const tool = wrapToolWithMetaNotice(new BashTool(makeSession(bridge)));
+		const result = await tool.execute("call-complete", { command: "seq 6000" }, undefined, undefined, context);
+
+		const text = result.content.find(c => c.type === "text")?.text ?? "";
+		expect(text).toContain("Read artifact://8 for full output");
+		expect(text).not.toContain("truncated before capture");
+		expect(result.details?.meta?.truncation?.sourceTruncated).toBeUndefined();
+	});
 });

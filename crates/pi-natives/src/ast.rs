@@ -493,6 +493,12 @@ fn compile_pattern(
 		.map_err(|err| Error::from_reason(err.to_string()))
 }
 
+/// A compiled pattern ast-grep itself parsed as an error node — non-fatal,
+/// reported once per run.
+fn pattern_error_issue(compiled: &Pattern, lang: SupportLang) -> Option<String> {
+	shared_ops::pattern_error_issue(compiled, lang)
+}
+
 fn apply_edits(content: &str, edits: &[Edit<String>]) -> Result<String> {
 	shared_ops::apply_edits(content, edits).map_err(|err| Error::from_reason(err.to_string()))
 }
@@ -546,6 +552,10 @@ struct CompiledFindPattern {
 	pattern:                String,
 	compiled_by_lang:       HashMap<String, Pattern>,
 	compile_errors_by_lang: HashMap<String, String>,
+	/// Per-language "this pattern cannot match anything" diagnostics for a
+	/// pattern that compiled but does not parse (see
+	/// `pi_ast::ops::pattern_parse_issue`).
+	parse_issues_by_lang:   HashMap<String, String>,
 }
 
 /// A rewrite rule compiled for every language discovered among the candidate
@@ -611,11 +621,15 @@ fn compile_find_patterns(
 		ct.heartbeat()?;
 		let mut compiled_by_lang = HashMap::with_capacity(languages.len());
 		let mut compile_errors_by_lang = HashMap::new();
+		let mut parse_issues_by_lang = HashMap::new();
 
 		for (lang_key, &language) in languages {
 			ct.heartbeat()?;
 			match compile_pattern(pattern, selector, strictness, language) {
 				Ok(compiled_pattern) => {
+					if let Some(issue) = pattern_error_issue(&compiled_pattern, language) {
+						parse_issues_by_lang.insert(lang_key.clone(), issue);
+					}
 					compiled_by_lang.insert(lang_key.clone(), compiled_pattern);
 				},
 				Err(err) => {
@@ -628,6 +642,7 @@ fn compile_find_patterns(
 			pattern: pattern.clone(),
 			compiled_by_lang,
 			compile_errors_by_lang,
+			parse_issues_by_lang,
 		});
 	}
 
@@ -675,6 +690,17 @@ pub fn ast_grep(options: AstFindOptions<'_>) -> task::Promise<AstFindResult> {
 		let retained_capacity = retained_find_capacity(normalized_offset, normalized_limit);
 		let mut retained_matches = BinaryHeap::new();
 		let mut parse_errors = Vec::new();
+		// Pattern-level diagnostics belong to the run, not to a file: report each
+		// unparseable pattern once, before any per-file errors.
+		for compiled in &compiled_patterns {
+			for (lang_key, issue) in &compiled.parse_issues_by_lang {
+				parse_errors.push(if languages.len() > 1 {
+					format!("{} ({lang_key}): {issue}", compiled.pattern)
+				} else {
+					format!("{}: {issue}", compiled.pattern)
+				});
+			}
+		}
 		let mut total_matches = 0u32;
 		let mut match_sequence = 0u64;
 		let mut files_with_matches = BTreeSet::new();
@@ -832,7 +858,12 @@ pub fn ast_match(options: AstMatchOptions<'_>) -> task::Promise<AstMatchResult> 
 		for pattern in &patterns {
 			ct.heartbeat()?;
 			match compile_pattern(pattern, selector.as_deref(), &strictness, language) {
-				Ok(compiled) => compiled_patterns.push(compiled),
+				Ok(compiled) => {
+					if let Some(issue) = pattern_error_issue(&compiled, language) {
+						parse_errors.push(format!("{pattern}: {issue}"));
+					}
+					compiled_patterns.push(compiled);
+				},
 				Err(err) => parse_errors.push(format!("{pattern}: {err}")),
 			}
 		}
@@ -988,6 +1019,15 @@ fn ast_edit_blocking(
 			ct.heartbeat()?;
 			match compile_pattern(&pattern, selector.as_deref(), &strictness, language) {
 				Ok(compiled) => {
+					// A rewrite pattern the engine parsed as an error node can never
+					// match, so `ast_edit` would report "no changes" with no reason.
+					if let Some(issue) = pattern_error_issue(&compiled, language) {
+						parse_errors.push(if languages.len() > 1 {
+							format!("{pattern} ({lang_key}): {issue}")
+						} else {
+							format!("{pattern}: {issue}")
+						});
+					}
 					compiled_by_lang.insert(lang_key.clone(), compiled);
 				},
 				Err(err) => {

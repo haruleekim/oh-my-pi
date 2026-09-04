@@ -338,13 +338,19 @@ export async function executeSend(
 				const reply = await waiting;
 				if (reply.error) {
 					if (reply.error instanceof IrcAwaitTargetStopped) {
-						// The awaited peer ran and stopped without replying: the send
-						// still succeeded, so surface a clean note instead of erroring
-						// out — and settle now rather than blocking the full timeout.
-						lines.push(
-							`${to} stopped without replying. ` +
-								`Check \`inbox\` or their transcript (history://${to}) for a later answer.`,
-						);
+						const lateReply = await reply.error.lateReply;
+						if (lateReply) {
+							waited = lateReply;
+							lines.push(`Reply from ${lateReply.from}:`);
+							lines.push(lateReply.body);
+						} else {
+							// Delivery succeeded, but neither the primary wait nor its
+							// bounded terminal-stop handoff observed a reply.
+							lines.push(
+								`${to} stopped without replying. ` +
+									`Check \`inbox\` or their transcript (history://${to}) for a later answer.`,
+							);
+						}
 					} else if (signal?.aborted) {
 						// The send already succeeded; if the wait was interrupted by our
 						// caller signal (steering / messaging), preserve the delivery receipt

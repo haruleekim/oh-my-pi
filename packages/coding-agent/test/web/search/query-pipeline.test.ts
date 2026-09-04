@@ -67,4 +67,43 @@ describe("web search directive pipeline", () => {
 			"Note: no results matched `site:nowhere.example`; the constraint was relaxed",
 		);
 	});
+
+	it("discloses that the provider ignored a required exact phrase", async () => {
+		// LLM-mediated engines answer a query they quietly loosened: asking for
+		// `"zzzz-omp-no-result-178843"` came back with unrelated hits and nothing
+		// told the model the literal phrase matched nothing.
+		stubProvider("brave", async () => ({
+			provider: "brave",
+			answer: "Here are some amateur radio callsign lookups.",
+			sources: SOURCES,
+		}));
+
+		const result = await runSearchQuery(
+			{ query: '"zzzz-omp-no-result-178843" lookup', provider: "brave" },
+			{ authStorage: {} as AuthStorage },
+		);
+
+		expect(result.content[0]?.text).toStartWith(
+			'Note: no results contained `"zzzz-omp-no-result-178843"`; the provider did not honor the exact phrase',
+		);
+		// Disclosure only — the returned sources are still handed over.
+		expect(result.details.response.sources).toHaveLength(SOURCES.length);
+	});
+
+	it("stays silent when a required phrase actually appears in the results", async () => {
+		// The phrase is only in a snippet, across a line break: normalization
+		// must find it there, otherwise every honest result gets a false
+		// "provider ignored your phrase" note.
+		stubProvider("brave", async () => ({
+			provider: "brave",
+			sources: [{ title: "Docs page", url: "https://docs.example.com/guide", snippet: "the exact\n  phrase here" }],
+		}));
+
+		const result = await runSearchQuery(
+			{ query: '"the exact phrase" guide', provider: "brave" },
+			{ authStorage: {} as AuthStorage },
+		);
+
+		expect(result.content[0]?.text).not.toContain("did not honor the exact phrase");
+	});
 });

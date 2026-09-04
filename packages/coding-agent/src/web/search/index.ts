@@ -28,7 +28,7 @@ import {
 	type SearchProvider,
 	type SearchProviderCandidate,
 } from "./provider";
-import { applyQueryConstraints, parseSearchQuery } from "./query";
+import { applyQueryConstraints, parseSearchQuery, unmatchedQueryPhrases } from "./query";
 import { renderSearchCall, renderSearchResult, type SearchRenderDetails } from "./render";
 import {
 	DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS,
@@ -234,6 +234,12 @@ async function executeSearch(
 				for (const label of filtered.dropped) {
 					constraintNotes.push(`no results matched \`${label}\`; the constraint was relaxed`);
 				}
+			}
+			// A provider that ignored a required phrase answers with sources that
+			// share no literal text with the request. Saying so beats presenting
+			// unrelated hits as matches.
+			for (const phrase of unmatchedQueryPhrases(finalResponse, parsedQuery)) {
+				constraintNotes.push(`no results contained \`"${phrase}"\`; the provider did not honor the exact phrase`);
 			}
 
 			if (!hasRenderableSearchContent(finalResponse)) {

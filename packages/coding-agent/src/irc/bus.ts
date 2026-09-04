@@ -55,20 +55,25 @@ interface IrcWaiter {
 
 /**
  * Rejection reason for a `send await:true` whose awaited peer reached a
- * terminal stop (ended its turn, parked, was aborted, or unregistered)
- * without ever replying. Distinct from a plain timeout so the sender can
- * surface "they stopped" instead of stranding the caller on the full
- * `irc.timeoutMs` window.
+ * terminal stop (ended its turn, parked, was aborted, or unregistered).
+ * `lateReply` observes the short, future-only handoff window kept open for a
+ * reply whose delivery was already queued when the stop signal arrived.
  */
 export class IrcAwaitTargetStopped extends Error {
-	constructor(target: string) {
+	readonly lateReply: Promise<IrcMessage | null>;
+
+	constructor(target: string, lateReply: Promise<IrcMessage | null>) {
 		super(`Awaited peer "${target}" stopped without replying.`);
 		this.name = "IrcAwaitTargetStopped";
+		this.lateReply = lateReply;
 	}
 }
 
 /** Mailbox cap per agent; oldest messages are dropped beyond it. */
 const MAILBOX_CAP = 100;
+
+/** Lets an already-queued reply cross the terminal-stop event-loop boundary. */
+const AWAIT_TARGET_REPLY_SETTLE_MS = 10;
 
 export class IrcBus {
 	static #global: IrcBus | undefined;
@@ -351,8 +356,8 @@ export class IrcBus {
 		// idle/parked when the send lands (the send is about to wake or revive
 		// it): it only aborts once the peer has actually been observed running
 		// and then stopped, or is unambiguously gone (unregistered / aborted).
-		// A real reply resolves the waiter first (the recipient sends it mid-turn,
-		// before the turn-end idle transition), so cleanup tears this down.
+		// A real reply resolves the primary waiter; one already queued at the stop
+		// boundary resolves the error's short-lived late waiter instead.
 		const awaitTarget = options?.awaitTarget;
 		if (awaitTarget) {
 			const { registry, target } = awaitTarget;
@@ -362,27 +367,35 @@ export class IrcBus {
 			// The peer's terminal `agent_end` is the authoritative "stopped" signal.
 			// It is emitted only after the peer's prompt fully unwinds (see
 			// AgentSession#flushPendingAgentEnd) and supersedes scheduled
-			// continuations. A side-channel auto-reply may outlive that main turn,
-			// though, so wait for it before declaring the peer stopped: its bus send
-			// resolves this waiter first; an empty/failed reply then falls through to
-			// the clean stopped result.
+			// continuations. Side-channel auto-replies are awaited first. An explicit
+			// reply send may still share this event-loop turn, so the stopped error
+			// carries a bounded, future-only waiter that the hub result checks before
+			// reporting the stop.
+			const settleStopped = (): void => {
+				if (!active) return;
+				const lateReply = this.wait(agentId, filter, AWAIT_TARGET_REPLY_SETTLE_MS, undefined, {
+					drainPending: false,
+				});
+				settle({ kind: "abort", error: new IrcAwaitTargetStopped(target, lateReply) });
+			};
 			const onSessionEvent = (event: AgentSessionEvent): void => {
 				if (event.type !== "agent_end" || event.isTerminal === false) return;
 				const session = subscribedSession;
 				if (!session) {
-					settle({ kind: "abort", error: new IrcAwaitTargetStopped(target) });
+					settleStopped();
 					return;
 				}
 				void session.waitForIrcReplies().then(() => {
 					if (!active || registry.get(target)?.session !== session) return;
-					settle({ kind: "abort", error: new IrcAwaitTargetStopped(target) });
+					settleStopped();
 				});
 			};
 			const sync = (): void => {
 				const ref = registry.get(target);
-				// Gone or hard-aborted: no reply will ever come.
+				// Gone or hard-aborted: no reply will ever start after the bounded
+				// handoff window opened by settleStopped.
 				if (!ref || ref.status === "aborted") {
-					settle({ kind: "abort", error: new IrcAwaitTargetStopped(target) });
+					settleStopped();
 					return;
 				}
 				// Follow the live session across a park→revive rebuild; tolerate a

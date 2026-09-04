@@ -787,7 +787,7 @@ describe("IRC", () => {
 			expect(b.delivered.map(msg => msg.body)).toEqual(["anyone there?"]);
 		});
 
-		it("op=send await=true round-trips the recipient's reply", async () => {
+		it("op=send await=true surfaces a reply sent before the recipient stops", async () => {
 			const main = makeFakeSession();
 			registry.register({ id: "0-Main", displayName: "main", kind: "main", session: main.session });
 			const sub = makeFakeSession();
@@ -796,10 +796,10 @@ describe("IRC", () => {
 			// never arms the liveness auto-cancel that op:"wait" uses.
 			registry.register({ id: "0-Sub", displayName: "task", kind: "sub", session: sub.session, status: "idle" });
 			sub.onDeliver(msg => {
-				// Reply synchronously during delivery: the tool has already parked
-				// a future-only waiter, so the immediate reply is handed directly
-				// to await:true instead of being double-buffered as unread mail.
+				// The reply resolves the pre-armed waiter before the terminal stop
+				// notification can settle the await as unanswered.
 				void bus.send({ from: "0-Sub", to: msg.from, body: "pong", replyTo: msg.id });
+				sub.endTurn();
 			});
 
 			const tool = new HubTool(makeToolSession(registry, "0-Main"));
@@ -808,6 +808,36 @@ describe("IRC", () => {
 			expect(details?.waited?.body).toBe("pong");
 			const text = result.content[0]?.type === "text" ? result.content[0].text : "";
 			expect(text).toContain("pong");
+		});
+
+		it("op=send await=true prefers a same-tick reply when the stop notification wins the race", async () => {
+			const main = makeFakeSession();
+			registry.register({ id: "0-Main", displayName: "main", kind: "main", session: main.session });
+			const sub = makeFakeSession();
+			registry.register({ id: "0-Sub", displayName: "task", kind: "sub", session: sub.session, status: "running" });
+			sub.onDeliver(msg => {
+				sub.endTurn();
+				queueMicrotask(() => {
+					void bus.send({ from: "0-Sub", to: msg.from, body: "same-tick reply", replyTo: msg.id });
+				});
+			});
+
+			const tool = new HubTool(makeToolSession(registry, "0-Main"));
+			const result = await tool.execute("call-1", {
+				op: "send",
+				to: "0-Sub",
+				message: "ping",
+				await: true,
+				timeoutMs: 120_000,
+			});
+
+			const details = result.details as CoordinationDetails | undefined;
+			expect(details?.waited?.body).toBe("same-tick reply");
+			expect(details?.receipts).toEqual([{ to: "0-Sub", outcome: "injected" }]);
+			const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+			expect(text).toContain("Reply from 0-Sub:");
+			expect(text).toContain("same-tick reply");
+			expect(text).not.toContain("stopped without replying");
 		});
 
 		it("op=send await=true ignores buffered stale mail and waits for a future reply", async () => {

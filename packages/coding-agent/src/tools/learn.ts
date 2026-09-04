@@ -4,6 +4,7 @@ import { sanitizeSkillName, writeManagedSkill } from "../autolearn/managed-skill
 import { isNameClaimedByAuthoredSkill } from "../extensibility/skills";
 import { localBackend } from "../memory-backend/local-backend";
 import learnDescription from "../prompts/tools/learn.md" with { type: "text" };
+import { ToolError } from "./tool-errors";
 import type { ToolSession } from ".";
 
 const learnSchema = type({
@@ -49,6 +50,10 @@ export class LearnTool implements AgentTool<typeof learnSchema> {
 	}
 
 	async execute(_id: string, params: LearnParams): Promise<AgentToolResult> {
+		if (!params.memory.trim()) {
+			throw new ToolError("A lesson needs non-empty content.");
+		}
+
 		// 1) Persist or queue the lesson to long-term memory (mirrors MemoryRetainTool).
 		const backend = this.session.settings.get("memory.backend");
 		let memoryMessage = "Lesson stored";
@@ -78,6 +83,7 @@ export class LearnTool implements AgentTool<typeof learnSchema> {
 			if (!id) {
 				throw new Error("Mnemopi did not store the lesson (no memory id returned).");
 			}
+			memoryMessage = `Lesson stored (memory id: ${id})`;
 		} else if (backend === "local") {
 			const result = await localBackend.save?.(
 				{ agentDir: this.session.settings.getAgentDir(), cwd: this.session.settings.getCwd() },

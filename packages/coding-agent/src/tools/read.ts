@@ -1,3 +1,4 @@
+import * as buffer from "node:buffer";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { notebookToEditableText } from "@oh-my-pi/pi-natives";
@@ -1518,6 +1519,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		let truncationInfo:
 			| { result: TruncationResult; options: { direction: "head"; startLine?: number; totalFileLines?: number } }
 			| undefined;
+		let rawBinaryNotice: string | undefined;
 
 		if (isVideoPath(absolutePath)) {
 			return this.#readVideoFile(absolutePath, localTarget.sel, fileSize, suffixResolution, question, signal);
@@ -1595,15 +1597,16 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			// (font, object, archive, packed blob) decodes to NUL/control bytes and
 			// U+FFFD mojibake that corrupts the terminal and burns context. Images,
 			// notebooks, and markit-convertible documents were already routed above;
-			// everything reaching here is meant to be plain text. `:raw` stays the
-			// explicit escape hatch for reading bytes verbatim. This single guard
-			// covers both the multi-range and single-range disk paths below.
-			const looksBinary =
-				!isRawSelector(parsed) &&
-				(wholeFileBytes
-					? isProbablyBinaryHeader(wholeFileBytes.subarray(0, BINARY_SNIFF_BYTES))
-					: await isProbablyBinary(absolutePath));
-			if (looksBinary) {
+			// everything reaching here is meant to be plain text. Non-raw reads
+			// refuse binary content; `:raw` still returns its requested rendering,
+			// but discloses that UTF-8 decoding can corrupt the original bytes.
+			const rawSelector = isRawSelector(parsed);
+			const looksBinary = wholeFileBytes
+				? rawSelector
+					? wholeFileBytes.indexOf(0) !== -1 || !buffer.isUtf8(wholeFileBytes)
+					: isProbablyBinaryHeader(wholeFileBytes.subarray(0, BINARY_SNIFF_BYTES))
+				: await isProbablyBinary(absolutePath);
+			if (!rawSelector && looksBinary) {
 				return toolResult<ReadToolDetails>({ resolvedPath: absolutePath, suffixResolution })
 					.text(
 						prependSuffixResolutionNotice(
@@ -1613,6 +1616,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					)
 					.sourcePath(absolutePath)
 					.done();
+			}
+			if (rawSelector && looksBinary) {
+				rawBinaryNotice = `[Binary content detected in '${resolvedDisplayPath}' (${formatBytes(fileSize)}). The ':raw' output is a UTF-8 text rendering and may be lossy: invalid byte sequences become U+FFFD, and control bytes remain embedded. Use the bash tool with a hex viewer such as \`xxd -g 1\` to inspect the original bytes.]`;
 			}
 			// Decode only what survived the sniff.
 			const buffered = wholeFileBytes ? deriveBufferedFileText(wholeFileBytes) : undefined;
@@ -1676,7 +1682,15 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 						suffixResolution,
 						undefined, // plain-file read: deterministic and fast, never abort mid-read
 					);
-					if (multiResult.bridgeResult) return multiResult.bridgeResult;
+					if (multiResult.bridgeResult) {
+						if (rawBinaryNotice) {
+							const firstText = multiResult.bridgeResult.content.find(
+								(content): content is TextContent => content.type === "text",
+							);
+							if (firstText) firstText.text = `${rawBinaryNotice}\n${firstText.text}`;
+						}
+						return multiResult.bridgeResult;
+					}
 					content = [{ type: "text", text: multiResult.outputText }];
 					sourcePath = absolutePath;
 					details = multiResult.displayContent ? { displayContent: multiResult.displayContent } : {};
@@ -1702,6 +1716,12 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 								entityLabel: "file",
 								raw: isRawSelector(sel),
 							});
+							if (rawBinaryNotice) {
+								const firstText = bridgeResult.content.find(
+									(content): content is TextContent => content.type === "text",
+								);
+								if (firstText) firstText.text = `${rawBinaryNotice}\n${firstText.text}`;
+							}
 							if (suffixResolution) {
 								const notice = `[Path '${suffixResolution.from}' not found; resolved to '${suffixResolution.to}' via suffix match]`;
 								const firstText = bridgeResult.content.find((c): c is TextContent => c.type === "text");
@@ -2018,6 +2038,14 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 
 		details.fileSize = fileSize;
 		markMarkdownContentType(this.session, details, absolutePath);
+		if (rawBinaryNotice) {
+			const firstText = content.find((content): content is TextContent => content.type === "text");
+			if (firstText) {
+				firstText.text = `${rawBinaryNotice}\n${firstText.text}`;
+			} else {
+				content = [{ type: "text", text: rawBinaryNotice }, ...content];
+			}
+		}
 		if (suffixResolution) {
 			details.suffixResolution = suffixResolution;
 			// Inline resolution notice into first text block so the model sees the actual path

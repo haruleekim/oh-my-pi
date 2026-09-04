@@ -124,6 +124,25 @@ pub fn compile_pattern(
 	Ok(compiled)
 }
 
+/// Report a *compiled* pattern that ast-grep itself considers an error node.
+///
+/// tree-sitter is lenient: `function (` compiles into a pattern rooted at an
+/// ERROR node, then matches nothing — which a caller cannot tell apart from a
+/// genuine no-match. `Pattern::has_error` is the engine's own verdict on the
+/// pattern it actually runs, so it stays right where raw-parsing the pattern
+/// text is wrong: a bare metavariable (`$A`) carries no root kind, and the
+/// JSON wrapped fallback above is judged on `{ "key": $V }` rather than on the
+/// unparseable fragment the caller typed.
+pub fn pattern_error_issue(compiled: &Pattern, lang: SupportLang) -> Option<String> {
+	compiled.has_error().then(|| {
+		format!(
+			"pattern is an error node for {} (ast-grep parsed it as invalid syntax), so it can never \
+			 match",
+			lang.canonical_name()
+		)
+	})
+}
+
 /// Language-specific wrapper template used to turn a multi-node fragment into a
 /// single selectable node. `None` for languages without a template — those keep
 /// the original `MultipleNode` error.
@@ -401,9 +420,17 @@ fn compile_rust_contextual_pattern(pattern: &str) -> Option<Pattern> {
 
 #[cfg(test)]
 mod tests {
-	use ast_grep_core::source::Edit;
+	use ast_grep_core::{MatchStrictness, source::Edit};
 
-	use super::{SupportLang, apply_edits, compile_search_patterns};
+	use super::{
+		SupportLang, apply_edits, compile_pattern, compile_search_patterns, pattern_error_issue,
+	};
+
+	fn issue_for(pattern: &str, lang: SupportLang) -> Option<String> {
+		let compiled = compile_pattern(pattern, None, &MatchStrictness::Smart, lang)
+			.unwrap_or_else(|err| panic!("pattern must compile: {pattern}: {err}"));
+		pattern_error_issue(&compiled, lang)
+	}
 
 	#[test]
 	fn compile_search_patterns_compiles_rust_patterns() {
@@ -431,5 +458,47 @@ mod tests {
 		];
 		let output = apply_edits(source, &edits).expect("identical edits should collapse to one");
 		assert_eq!(output, "axef");
+	}
+
+	#[test]
+	fn pattern_error_issue_flags_a_pattern_that_can_never_match() {
+		// `function (` compiles (tree-sitter yields an ERROR node) and then
+		// matches nothing, which a caller cannot tell apart from a genuine
+		// no-match — so it has to be reported.
+		let issue = issue_for("function (", SupportLang::TypeScript)
+			.expect("an error-node pattern must be reported");
+		assert!(issue.contains("typescript"), "issue names the language: {issue}");
+		assert!(issue.contains("can never match"), "issue names the consequence: {issue}");
+	}
+
+	#[test]
+	fn pattern_error_issue_stays_silent_for_valid_patterns() {
+		// Metavariables, multi-statement bodies, and bare call fragments all
+		// compile to real patterns; flagging them would make the diagnostic
+		// useless.
+		for pattern in
+			["function $NAME($$$ARGS) { $$$BODY }", "foo($$$ARGS)", "$A.b", "class $_ { $$$ }"]
+		{
+			assert_eq!(
+				issue_for(pattern, SupportLang::TypeScript),
+				None,
+				"valid pattern must not be flagged: {pattern}"
+			);
+		}
+	}
+
+	#[test]
+	fn pattern_error_issue_accepts_the_json_fragments_compile_pattern_supports() {
+		// `"key": $V` only compiles through `compile_wrapped_fallback` (it is a
+		// `MultipleNode` fragment), and a bare `$A` is a root-kind-less
+		// metavariable. Judging the raw pattern text instead of the compiled
+		// pattern reported both as "can never match" while they matched fine.
+		for pattern in ["\"key\": $V", "$A"] {
+			assert_eq!(
+				issue_for(pattern, SupportLang::Json),
+				None,
+				"documented JSON fragment must not be flagged: {pattern}"
+			);
+		}
 	}
 }

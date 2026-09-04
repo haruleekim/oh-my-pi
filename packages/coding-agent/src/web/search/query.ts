@@ -16,7 +16,7 @@
  *    reported rather than returning nothing.
  */
 
-import type { SearchSource } from "./types";
+import type { SearchCitation, SearchSource } from "./types";
 
 /** One free-text token of the query (everything that is not a recognized directive). */
 export interface QueryTerm {
@@ -847,4 +847,44 @@ export function applyQueryConstraints(sources: readonly SearchSource[], q: Struc
 		else dropped.push(dim.label);
 	}
 	return { sources: current, dropped };
+}
+
+/** Lowercase + collapse whitespace so a snippet's line breaks cannot hide a phrase. */
+function normalizeForPhraseMatch(text: string): string {
+	return text.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Required phrases (`"exact phrase"`, `+verbatim`) that appear nowhere in what
+ * the provider returned.
+ *
+ * Every provider claiming phrase syntax receives these verbatim, but none
+ * *guarantees* them: an LLM-mediated engine can quietly search something
+ * looser and answer with sources that share no literal text with the request.
+ * Unlike the constraint dimensions above a phrase cannot be post-filtered — a
+ * page may contain it in a body the snippet never shows — so this reports only
+ * the unambiguous case: the phrase occurs in no answer, citation, title, url,
+ * or snippet that came back. The caller turns that into a note; results are
+ * never dropped on this signal.
+ */
+export function unmatchedQueryPhrases(
+	response: { answer?: string; sources: readonly SearchSource[]; citations?: readonly SearchCitation[] },
+	q: StructuredQuery,
+): string[] {
+	const phrases = q.terms.filter(term => term.phrase && !term.negated && term.text.trim().length > 0);
+	if (phrases.length === 0) return [];
+	const haystack = normalizeForPhraseMatch(
+		[
+			response.answer ?? "",
+			...response.sources.flatMap(source => [source.title, source.url, source.snippet ?? ""]),
+			...(response.citations ?? []).flatMap(citation => [citation.title, citation.url, citation.citedText ?? ""]),
+		].join(" "),
+	);
+	if (haystack.length === 0) return [];
+	const unmatched: string[] = [];
+	for (const phrase of phrases) {
+		const needle = normalizeForPhraseMatch(phrase.text);
+		if (needle.length > 0 && !haystack.includes(needle)) unmatched.push(phrase.text.trim());
+	}
+	return unmatched;
 }

@@ -50,6 +50,13 @@ export interface TruncationMeta {
 	 * size; renders a distinct "partial" notice instead of a line range.
 	 */
 	partialLine?: boolean;
+	 * The captured stream was ALREADY incomplete before this result was
+	 * assembled — e.g. an ACP client terminal dropped bytes past its own
+	 * buffer limit, so nothing downstream ever saw them. An artifact of this
+	 * result therefore holds the captured output, not the full output, and the
+	 * notice must not promise otherwise.
+	 */
+	sourceTruncated?: boolean;
 }
 
 /**
@@ -105,6 +112,8 @@ export interface TruncationSummaryOptions {
 	direction: "head" | "tail" | "middle";
 	startLine?: number;
 	totalFileLines?: number;
+	/** See {@link TruncationMeta.sourceTruncated}. */
+	sourceTruncated?: boolean;
 }
 
 export interface TruncationTextOptions {
@@ -233,7 +242,7 @@ export class OutputMetaBuilder {
 		}
 		if (!summary.truncated) return this;
 
-		const { direction, startLine = 1, totalFileLines } = options;
+		const { direction, startLine = 1, totalFileLines, sourceTruncated } = options;
 		const totalLines = totalFileLines ?? summary.totalLines;
 
 		// Middle elision: the sink retained head + tail with an elision marker.
@@ -254,6 +263,7 @@ export class OutputMetaBuilder {
 				elidedBytes: summary.elidedBytes,
 				elidedLines,
 				artifactId: summary.artifactId,
+				...(sourceTruncated ? { sourceTruncated: true } : {}),
 			};
 			return this;
 		}
@@ -285,6 +295,7 @@ export class OutputMetaBuilder {
 			outputBytes: summary.outputBytes,
 			shownRange: { start: shownStart, end: shownEnd },
 			artifactId: summary.artifactId,
+			...(sourceTruncated ? { sourceTruncated: true } : {}),
 			nextOffset: direction === "head" ? shownEnd + 1 : undefined,
 		};
 
@@ -425,6 +436,21 @@ export function formatFullOutputReference(artifactId: string): string {
 	return `Read artifact://${artifactId} for full output`;
 }
 
+/**
+ * Artifact reference for output whose source stream was already truncated
+ * before capture: the artifact is everything that was ever captured, and the
+ * missing bytes are gone for good. Never promises "full output".
+ */
+export function formatCapturedOutputReference(artifactId: string): string {
+	return `Read artifact://${artifactId} for the captured output (the stream was truncated before capture; the rest was never captured)`;
+}
+
+function formatArtifactReference(truncation: TruncationMeta, artifactId: string): string {
+	return truncation.sourceTruncated
+		? formatCapturedOutputReference(artifactId)
+		: formatFullOutputReference(artifactId);
+}
+
 const RAW_OUTPUT_ARTIFACT_PREFIX = "[raw output: artifact://";
 const RAW_OUTPUT_ARTIFACT_SUFFIX = "]";
 
@@ -497,7 +523,7 @@ export function formatTruncationMetaNotice(truncation: TruncationMeta): string {
 			notice += `. Use :${truncation.nextOffset} to continue`;
 		}
 		if (truncation.artifactId != null) {
-			notice += `. ${formatFullOutputReference(truncation.artifactId)}`;
+			notice += `. ${formatArtifactReference(truncation, truncation.artifactId)}`;
 		}
 		return notice;
 	}
@@ -528,7 +554,7 @@ export function formatTruncationMetaNotice(truncation: TruncationMeta): string {
 	}
 
 	if (truncation.artifactId != null) {
-		notice += `. ${formatFullOutputReference(truncation.artifactId)}`;
+		notice += `. ${formatArtifactReference(truncation, truncation.artifactId)}`;
 	}
 
 	return notice;
@@ -821,6 +847,9 @@ async function spillLargeResultToArtifact(
 			elidedLines,
 			elidedBytes,
 			artifactId,
+			// The spill only re-cuts what the tool already handed us: if that
+			// text was itself an incomplete capture, the artifact is too.
+			...(existingMeta?.truncation?.sourceTruncated ? { sourceTruncated: true } : {}),
 			nextOffset: existingMeta?.truncation?.nextOffset,
 		};
 	} else {
@@ -835,6 +864,7 @@ async function spillLargeResultToArtifact(
 			maxBytes: tailBytes,
 			shownRange: { start: shownStart, end: truncated.totalLines },
 			artifactId,
+			...(existingMeta?.truncation?.sourceTruncated ? { sourceTruncated: true } : {}),
 			nextOffset: existingMeta?.truncation?.nextOffset,
 		};
 	}

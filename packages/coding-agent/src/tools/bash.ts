@@ -714,6 +714,12 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			requestedTimeoutSec?: number;
 			notices?: readonly string[];
 			wallTimeMs?: number;
+			/**
+			 * The capture itself lost bytes before we saw them (an ACP client
+			 * terminal dropped output past its own buffer limit), so no artifact
+			 * of this result can be the full stream.
+			 */
+			sourceTruncated?: boolean;
 		} = {},
 	): Promise<AgentToolResult<BashToolDetails>> {
 		const exitCode = result.exitCode;
@@ -780,7 +786,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			const timeoutOutputText = await enforceInlineByteCap(outputLines.join("\n"), inlineCap);
 			return toolResult(details)
 				.content([{ type: "text", text: timeoutOutputText }, ...(result.images ?? [])])
-				.truncationFromSummary(result, { direction: "tail" })
+				.truncationFromSummary(result, { direction: "tail", sourceTruncated: options.sourceTruncated })
 				.error()
 				.done();
 		}
@@ -793,7 +799,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 
 		const resultBuilder = toolResult(details)
 			.content([{ type: "text", text: cappedOutputText }, ...(result.images ?? [])])
-			.truncationFromSummary(result, { direction: "tail" });
+			.truncationFromSummary(result, { direction: "tail", sourceTruncated: options.sourceTruncated });
 		if (failedExit) resultBuilder.error();
 		return resultBuilder.done();
 	}
@@ -1414,13 +1420,17 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 				};
 
 				const bridgeNotices: string[] = [];
-				if (finalOutput.truncated) bridgeNotices.push("(output truncated)");
+				// The client terminal dropped output past its own buffer limit: those
+				// bytes never reached this process, so neither the inline body nor any
+				// artifact of it can be the complete stream.
+				if (finalOutput.truncated) bridgeNotices.push("(output truncated by the client terminal)");
 				for (const notice of pendingNotices) bridgeNotices.push(notice);
 
 				return this.#buildCompletedResult(bridgeResult, timeoutSec, {
 					requestedTimeoutSec,
 					notices: bridgeNotices,
 					wallTimeMs: performance.now() - bridgeWallTimeStart,
+					sourceTruncated: finalOutput.truncated,
 				});
 			} finally {
 				clearTimeout(timeoutTimer);
