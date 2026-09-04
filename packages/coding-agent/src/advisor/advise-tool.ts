@@ -37,6 +37,9 @@ export interface AdvisorNote {
 	advisor?: string;
 }
 
+/** `customType` of the batched advisor card carried in the transcript. */
+export const ADVISOR_MESSAGE_TYPE = "advisor";
+
 /** Details payload on the batched `advisor` custom message rendered in the transcript. */
 export interface AdvisorMessageDetails {
 	notes: AdvisorNote[];

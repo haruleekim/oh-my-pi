@@ -11,6 +11,7 @@ import {
 	truncateToWidth,
 } from "@oh-my-pi/pi-tui";
 import { isRecord, sanitizeText } from "@oh-my-pi/pi-utils";
+import { ADVISOR_MESSAGE_TYPE } from "../../advisor";
 import type { TreeFilterMode } from "../../config/settings-schema";
 import { theme } from "../../modes/theme/theme";
 import {
@@ -459,7 +460,7 @@ class TreeList implements Component {
 			}
 			case "custom_message": {
 				parts.push(entry.customType);
-				if (entry.customType === "advisor") {
+				if (entry.customType === ADVISOR_MESSAGE_TYPE) {
 					const { qualifier, text } = advisorTreeDisplay(entry.details);
 					if (qualifier) parts.push(qualifier);
 					if (text) parts.push(text);
@@ -762,7 +763,7 @@ class TreeList implements Component {
 				break;
 			}
 			case "custom_message": {
-				if (entry.customType === "advisor") {
+				if (entry.customType === ADVISOR_MESSAGE_TYPE) {
 					const { qualifier, text } = advisorTreeDisplay(entry.details);
 					const label = qualifier ? `advisor (${qualifier}): ` : "advisor: ";
 					result = theme.fg("customMessageLabel", label) + normalize(text);

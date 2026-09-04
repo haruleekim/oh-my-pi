@@ -42,6 +42,7 @@ import {
 	type AdvisorAgent,
 	type AdvisorConfig,
 	AdvisorEmissionGuard,
+	ADVISOR_MESSAGE_TYPE,
 	AdvisorLoopGuard,
 	type AdvisorMessageDetails,
 	type AdvisorNote,
@@ -1168,7 +1169,7 @@ export class SessionAdvisors {
 						? null
 						: ({
 								role: "custom",
-								customType: "advisor",
+								customType: ADVISOR_MESSAGE_TYPE,
 								display: true,
 								attribution: "agent",
 								timestamp: Date.now(),
@@ -1244,7 +1245,7 @@ export class SessionAdvisors {
 		if (channel === "preserve") {
 			this.#host.preserveAdvisorCard({
 				role: "custom",
-				customType: "advisor",
+				customType: ADVISOR_MESSAGE_TYPE,
 				content,
 				display: true,
 				attribution: "agent",
@@ -1268,7 +1269,7 @@ export class SessionAdvisors {
 		if (this.#host.planModeState()?.enabled || cannotAutoTrigger) {
 			this.#host.preserveAdvisorCard({
 				role: "custom",
-				customType: "advisor",
+				customType: ADVISOR_MESSAGE_TYPE,
 				content,
 				display: true,
 				attribution: "agent",
@@ -1284,7 +1285,7 @@ export class SessionAdvisors {
 		this.#recordAdvisorInterruptDelivered();
 		void this.#host
 			.sendCustomMessage(
-				{ customType: "advisor", content, display: true, attribution: "agent", details },
+				{ customType: ADVISOR_MESSAGE_TYPE, content, display: true, attribution: "agent", details },
 				{ deliverAs: "steer", triggerTurn: true },
 			)
 			.catch(err => logger.debug("advisor delivery failed", { err: String(err) }));

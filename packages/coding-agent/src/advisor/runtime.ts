@@ -11,6 +11,7 @@ import {
 	formatSessionHistoryMarkdown,
 	PRIMARY_CONTEXT_CUSTOM_TYPES,
 } from "../session/session-history-format";
+import { ADVISOR_MESSAGE_TYPE } from "./advise-tool";
 import { ADVISOR_RENDER_OPTIONS, renderAdvisorDeltaChunks } from "./delta-split";
 import { fingerprintMessage } from "./message-fingerprint";
 
@@ -741,7 +742,7 @@ export class AdvisorRuntime {
 
 	#formatRawDelta(rawMessages: AgentMessage[], wip = false, updateSeenContext = true): string | null {
 		const delta = rawMessages
-			.filter(message => !(message.role === "custom" && message.customType === "advisor"))
+			.filter(message => !(message.role === "custom" && message.customType === ADVISOR_MESSAGE_TYPE))
 			.map(message =>
 				updateSeenContext ? this.#dedupContextMessage(message) : this.#dedupContextMessageReadOnly(message),
 			);
@@ -1078,7 +1079,7 @@ export class AdvisorRuntime {
 		// snapshot across coalescing re-prepares within one in-flight batch.
 		this.#seenContextInFlight ??= [...this.#seenContext];
 		const preparedMessages = rawMessages
-			.filter(message => !(message.role === "custom" && message.customType === "advisor"))
+			.filter(message => !(message.role === "custom" && message.customType === ADVISOR_MESSAGE_TYPE))
 			.map(message => this.#dedupContextMessage(message));
 		const batch = this.#renderPreparedDelta(preparedMessages, wip);
 		return { batch: batch ?? fallback, preparedMessages };

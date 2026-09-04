@@ -2419,6 +2419,57 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	});
 
+	it("replays an advisor intervention as its own card, never as a user message", async () => {
+		const harness = await createHarness();
+		const stored = new FakeAgentSession(harness.cwdA);
+		harness.sessions.push(stored);
+		stored.sessionManager.appendMessage({ role: "user", content: "start", timestamp: Date.now() });
+		stored.sessionManager.appendCustomMessageEntry(
+			"advisor",
+			'<advisory severity="blocker" guidance="weigh, don\'t blindly obey">\nRe-read the spec\n</advisory>',
+			true,
+			{ notes: [{ note: "Re-read the spec", severity: "blocker", advisor: "reviewer" }] },
+			"agent",
+		);
+		await stored.sessionManager.ensureOnDisk();
+		await stored.sessionManager.flush();
+
+		await harness.agent.loadSession({
+			sessionId: stored.sessionId,
+			cwd: harness.cwdA,
+			mcpServers: [],
+		});
+
+		const replayed = harness.updates.filter(update => update.sessionId === stored.sessionId);
+		// The `<advisory>` bytes are addressed to the model. Replaying them as a
+		// user chunk made a reopened session look like the user said them.
+		expect(
+			replayed.filter(
+				update =>
+					update.update.sessionUpdate === "user_message_chunk" &&
+					update.update.content.type === "text" &&
+					update.update.content.text.includes("<advisory"),
+			),
+		).toHaveLength(0);
+		const cards = replayed.filter(
+			update => update.update.sessionUpdate === "tool_call" && update.update.toolCallId.startsWith("advisor-"),
+		);
+		expect(cards).toHaveLength(1);
+		const card = cards[0]!.update;
+		if (card.sessionUpdate !== "tool_call") throw new Error("expected a tool_call update");
+		expect(card.title).toBe("Advisor · blocker");
+		expect(card.status).toBe("completed");
+		expect(card.content).toEqual([
+			{ type: "content", content: { type: "text", text: "> **blocker** _(reviewer)_ — Re-read the spec" } },
+		]);
+		expect(card._meta?.advisor_notes).toEqual([
+			{ note: "Re-read the spec", severity: "blocker", advisor: "reviewer" },
+		]);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
 	it("emits ACP plan updates from live todo results", async () => {
 		const harness = await createHarness();
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });

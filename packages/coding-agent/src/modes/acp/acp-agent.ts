@@ -76,6 +76,7 @@ import {
 } from "../../plan-mode/approved-plan";
 import { getEditStore } from "../../edit/store";
 import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
+import { ADVISOR_MESSAGE_TYPE } from "../../advisor";
 import { planMarkdownToolCallContent } from "../../session/acp-tool-content";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "../../session/async-job-delivery";
 import { BlobStore, resolveImageDataSync } from "../../session/blob-store";
@@ -110,6 +111,7 @@ import {
 } from "./acp-background-work";
 import { createAcpClientBridge } from "./acp-client-bridge";
 import {
+	buildAdvisorCardNotifications,
 	extractAssistantMessageText,
 	mapAgentSessionEventToAcpSessionUpdates,
 	normalizeReplayToolArguments,
@@ -2660,6 +2662,13 @@ export class AcpAgent implements Agent {
 	): SessionNotification[] {
 		if (message.role === "assistant") {
 			return this.#replayAssistantMessage(sessionId, message, cwd, replayedToolCallIds, replayedToolCallArgs);
+		}
+		// Advisor cards replay as their own card. The generic custom-message
+		// branch below would send them as `user_message_chunk`, which shows a
+		// reopened session attributing the advisor's `<advisory>` XML to the
+		// user — worse than the live path, which used to drop them entirely.
+		if (message.role === "custom" && message.customType === ADVISOR_MESSAGE_TYPE) {
+			return buildAdvisorCardNotifications(sessionId, message.details);
 		}
 		if (
 			message.role === "user" ||

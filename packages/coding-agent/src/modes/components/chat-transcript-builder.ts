@@ -14,7 +14,7 @@
 import type { AgentMessage, AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { Usage } from "@oh-my-pi/pi-ai";
 import type { Component, TUI } from "@oh-my-pi/pi-tui";
-import type { AdvisorMessageDetails } from "../../advisor";
+import { ADVISOR_MESSAGE_TYPE, type AdvisorMessageDetails } from "../../advisor";
 import { COLLAB_PROMPT_MESSAGE_TYPE, type CollabPromptDetails } from "../../collab/protocol";
 import { settings } from "../../config/settings";
 import type { MessageRenderer } from "../../extensibility/extensions/types";
@@ -560,7 +560,7 @@ export class ChatTranscriptBuilder {
 			this.container.addChild(buildIrcMessageCard(message, () => this.#expanded));
 			return;
 		}
-		if (message.customType === "advisor") {
+		if (message.customType === ADVISOR_MESSAGE_TYPE) {
 			const details = (message as CustomMessage<AdvisorMessageDetails>).details;
 			this.container.addChild(createAdvisorMessageCard(details, () => this.#expanded, theme));
 			return;

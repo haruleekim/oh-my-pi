@@ -10,6 +10,8 @@ import type {
 } from "@oh-my-pi/pi-utils/acp";
 import { parseXdUrl } from "../../internal-urls/xd-protocol";
 import { editTargetPaths } from "../../edit/target-paths";
+import type { AdvisorNote, AdvisorSeverity } from "../../advisor";
+import { isAdvisorCard } from "../../session/queued-messages";
 import type { AgentSessionEvent } from "../../session/agent-session";
 import { shellSourceToolCallContent } from "../../session/acp-tool-content";
 import { resolveToCwd, splitPathAndSel, splitPathAndSelPreferringLiteralSync } from "../../tools/path-utils";
@@ -285,6 +287,12 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 		case "message_update":
 			return mapAssistantMessageUpdate(event, sessionId, options);
 		case "message_end":
+			// An advisor card is not the assistant speaking: it is a second
+			// voice that interrupted the turn. Map it to its own card instead
+			// of letting the assistant-text path drop it.
+			if (isAdvisorCard(event.message)) {
+				return buildAdvisorCardNotifications(sessionId, event.message.details);
+			}
 			return mapAssistantMessageEnd(event, sessionId, options);
 		case "tool_execution_start": {
 			if (isInternalHubMessageTool(event.toolName, event.args)) return [];
@@ -476,6 +484,86 @@ function mapAssistantMessageEnd(
 			sessionUpdate: "agent_message_chunk",
 			content: { type: "text", text },
 			messageId,
+		}),
+	];
+}
+
+const ADVISOR_SEVERITIES: ReadonlySet<string> = new Set(["nit", "concern", "blocker"] satisfies AdvisorSeverity[]);
+
+function isAdvisorSeverity(value: string | undefined): value is AdvisorSeverity {
+	return value !== undefined && ADVISOR_SEVERITIES.has(value);
+}
+
+/**
+ * Notes off an `advisor` custom message. Read defensively: on replay these
+ * arrive as persisted JSON, so a note is only kept when it actually carries
+ * text, and `severity`/`advisor` only when they carry the values the advisor
+ * tool records. The implicit single advisor stamps no name — matching the TUI
+ * card, an explicit `"default"` is treated as unnamed too.
+ */
+function extractAdvisorNotes(details: unknown): AdvisorNote[] {
+	if (typeof details !== "object" || details === null) return [];
+	const raw = (details as { notes?: unknown }).notes;
+	if (!Array.isArray(raw)) return [];
+	const notes: AdvisorNote[] = [];
+	for (const entry of raw) {
+		const note = extractStringProperty<AdvisorNote>(entry, "note")?.trim();
+		if (!note) continue;
+		const severity = extractStringProperty<AdvisorNote>(entry, "severity");
+		const advisor = extractStringProperty<AdvisorNote>(entry, "advisor")?.trim();
+		notes.push({
+			note,
+			...(isAdvisorSeverity(severity) ? { severity } : {}),
+			...(advisor && advisor !== "default" ? { advisor } : {}),
+		});
+	}
+	return notes;
+}
+
+/** Severity of a single note, or the batch size — whichever the collapsed card can act on. */
+function advisorCardTitle(notes: readonly AdvisorNote[]): string {
+	const first = notes[0];
+	if (notes.length === 1 && first) return `Advisor · ${first.severity ?? "note"}`;
+	const blockers = notes.filter(note => note.severity === "blocker").length;
+	const title = `Advisor · ${notes.length} notes`;
+	return blockers > 0 ? `${title} · ${blockers} blocker${blockers === 1 ? "" : "s"}` : title;
+}
+
+/** One note as a blockquote: the client analogue of the TUI card's severity rail. */
+function advisorNoteMarkdown(note: AdvisorNote): string {
+	const who = note.advisor ? ` _(${note.advisor})_` : "";
+	return `**${note.severity ?? "note"}**${who} — ${note.note}`
+		.split("\n")
+		.map(line => (line.length > 0 ? `> ${line}` : ">"))
+		.join("\n");
+}
+
+/**
+ * An advisor intervention as a client-visible card.
+ *
+ * Advisors are a second voice in the session: they interrupt the primary
+ * agent mid-turn, so a client that cannot see them shows direction changes
+ * with no stated cause. The agent-facing bytes are an `<advisory>` XML block
+ * addressed to the model, so the card is rebuilt from the structured notes
+ * instead. `_meta.advisor_notes` carries those notes verbatim for clients
+ * that render advisories with their own chrome; the Markdown body is what
+ * every other client falls back to.
+ *
+ * Emitted `completed`: the note already happened, and nothing updates the
+ * card afterwards.
+ */
+export function buildAdvisorCardNotifications(sessionId: string, details: unknown): SessionNotification[] {
+	const notes = extractAdvisorNotes(details);
+	if (notes.length === 0) return [];
+	return [
+		toSessionNotification(sessionId, {
+			sessionUpdate: "tool_call",
+			toolCallId: `advisor-${crypto.randomUUID()}`,
+			title: advisorCardTitle(notes),
+			kind: "think",
+			status: "completed",
+			content: [{ type: "content", content: { type: "text", text: notes.map(advisorNoteMarkdown).join("\n\n") } }],
+			_meta: { advisor_notes: notes },
 		}),
 	];
 }

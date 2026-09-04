@@ -28,6 +28,7 @@
 - ACP tool cards are now named by what the call does: the model's intent when it sent one (recovered from the recorded arguments when a session is reopened), otherwise the target — the files an `edit` touches, an `ast_grep` pattern, an `lsp` action, a `hub` op — instead of the bare tool name or a pasted command.
 - `edit` and `ast_edit` now report their target files to ACP clients as tool-call locations while the call streams, so the editor can open them before the result lands.
 - `eval` tool cards in ACP clients are now titled by the cell's own label instead of a `[py]`-style language prefix; the language still travels on the source resource, so clients can name the runtime in the card itself.
+- Advisor interventions now reach ACP clients as their own card instead of being invisible: the notes render as Markdown, severity is in the card title, and clients that want their own chrome get the notes structurally in `_meta.advisor_notes`.
 
 ### Fixed
 
@@ -190,6 +191,7 @@
 - Large text edits now render as native diffs in live ACP clients without duplicate hashline output, while binary and oversized files show explicit fallback reasons.
 - Fixed ACP clients going silent after `/fresh` or a context reset: session notifications, permission requests, and elicitations are now always addressed by the session id the client holds instead of the rotated provider-side id.
 - ACP plan review cards now keep the full plan Markdown after approve or refine, instead of replacing it with the result line.
+- Reopening a session in an ACP client no longer replays advisor notes as user messages, which made the agent-facing `<advisory>` blocks look like something the user had typed.
 - File writes now render as diffs in ACP clients instead of showing only the write summary.
 - Anthropic sessions now keep tool-roster changes and warm-prefix pruning from invalidating preserved thinking or the prompt cache.
 - TypeScript code intelligence now works on TypeScript 7 projects: the built-in `typescript-native` server runs `tsc --lsp --stdio` when the resolved TypeScript install no longer ships `tsserver.js`, replacing `typescript-language-server` for that project.

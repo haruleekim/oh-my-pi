@@ -3,7 +3,7 @@ import type { AssistantMessage, ImageContent, Message, Usage } from "@oh-my-pi/p
 import { getStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { type Component, Spacer, Text, TruncatedText } from "@oh-my-pi/pi-tui";
 import { logger } from "@oh-my-pi/pi-utils";
-import type { AdvisorMessageDetails } from "../../advisor";
+import { ADVISOR_MESSAGE_TYPE, type AdvisorMessageDetails } from "../../advisor";
 import { COLLAB_PROMPT_MESSAGE_TYPE, type CollabPromptDetails } from "../../collab/protocol";
 import { settings } from "../../config/settings";
 import { createAdvisorMessageCard } from "../../modes/components/advisor-message";
@@ -234,7 +234,7 @@ export class UiHelpers {
 						this.ctx.chatContainer.addChild(card);
 						return [card];
 					}
-					if (message.customType === "advisor") {
+					if (message.customType === ADVISOR_MESSAGE_TYPE) {
 						const details = (message as CustomMessage<AdvisorMessageDetails>).details;
 						this.ctx.chatContainer.addChild(
 							createAdvisorMessageCard(details, () => this.ctx.toolOutputExpanded, theme),

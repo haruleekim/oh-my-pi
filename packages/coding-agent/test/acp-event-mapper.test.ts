@@ -155,6 +155,103 @@ describe("ACP event mapper", () => {
 		);
 	});
 
+	it("maps an advisor intervention to its own card instead of dropping it", () => {
+		// The `content` bytes are the agent-facing `<advisory>` XML; the card is
+		// rebuilt from the structured notes so the client shows prose, and the
+		// notes ride `_meta` for clients that render advisories themselves.
+		const advisorCard = {
+			role: "custom" as const,
+			customType: "advisor",
+			display: true,
+			attribution: "agent" as const,
+			content:
+				'<advisory severity="concern" guidance="weigh, don\'t blindly obey">\nUse bun run test:rs\n</advisory>',
+			details: { notes: [{ note: "Use `bun run test:rs`", severity: "concern" }] },
+		};
+
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{ type: "message_end", message: advisorCard } as unknown as AgentSessionEvent,
+			"session-1",
+		);
+
+		expect(updates).toHaveLength(1);
+		expectAcpNotifications(updates);
+		const update = updates[0]!.update as {
+			sessionUpdate: string;
+			toolCallId: string;
+			title: string;
+			kind: string;
+			status: string;
+			content: Array<{ type: string; content: { type: string; text: string } }>;
+			_meta: { advisor_notes: unknown };
+		};
+		expect(update.sessionUpdate).toBe("tool_call");
+		expect(update.toolCallId.startsWith("advisor-")).toBe(true);
+		expect(update.title).toBe("Advisor · concern");
+		expect(update.kind).toBe("think");
+		expect(update.status).toBe("completed");
+		expect(update.content).toEqual([
+			{ type: "content", content: { type: "text", text: "> **concern** — Use `bun run test:rs`" } },
+		]);
+		expect(update._meta.advisor_notes).toEqual([{ note: "Use `bun run test:rs`", severity: "concern" }]);
+
+		// Clients upsert tool cards by id, so a shared id would make each note
+		// overwrite the previous card in place — one visible advisory for a
+		// whole turn's worth of notes, and no error anywhere.
+		const repeat = mapAgentSessionEventToAcpSessionUpdates(
+			{ type: "message_end", message: advisorCard } as unknown as AgentSessionEvent,
+			"session-1",
+		);
+		const repeatUpdate = repeat[0]!.update as { toolCallId: string };
+		expect(repeatUpdate.toolCallId).not.toBe(update.toolCallId);
+	});
+
+	it("names a batched advisory by its size and attributes each note to its advisor", () => {
+		const updates = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "message_end",
+				message: {
+					role: "custom",
+					customType: "advisor",
+					content: "ignored",
+					details: {
+						notes: [
+							{ note: "first\n\nsecond line", severity: "blocker", advisor: "reviewer" },
+							{ note: "  ", severity: "nit" },
+							{ note: "unnamed", advisor: "default" },
+						],
+					},
+				},
+			} as unknown as AgentSessionEvent,
+			"session-1",
+		);
+
+		const update = updates[0]!.update as {
+			title: string;
+			content: Array<{ content: { text: string } }>;
+		};
+		// The blank note is dropped, so the count reflects what the card shows.
+		expect(update.title).toBe("Advisor · 2 notes · 1 blocker");
+		expect(update.content[0]!.content.text).toBe(
+			"> **blocker** _(reviewer)_ — first\n>\n> second line\n\n> **note** — unnamed",
+		);
+	});
+
+	it("emits nothing for an advisory with no usable notes or a non-advisor custom message", () => {
+		for (const message of [
+			{ role: "custom", customType: "advisor", content: "x", details: { notes: [{ note: "" }] } },
+			{ role: "custom", customType: "advisor", content: "x", details: undefined },
+			{ role: "custom", customType: "skill-prompt", content: "x", details: { notes: [{ note: "hi" }] } },
+		]) {
+			expect(
+				mapAgentSessionEventToAcpSessionUpdates(
+					{ type: "message_end", message } as unknown as AgentSessionEvent,
+					"session-1",
+				),
+			).toEqual([]);
+		}
+	});
+
 	it("emits final assistant text losslessly when no text deltas were observed", () => {
 		const marker = "MESSAGE-END-MARKER";
 		const text = `${"f".repeat(4_001 - marker.length)}${marker}`;
