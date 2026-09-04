@@ -29,7 +29,14 @@ function createMockSession(onPrompt: (params: { emit: (event: AgentSessionEvent)
 		agent: { state: { systemPrompt: ["test"] } },
 		model: undefined,
 		extensionRunner: undefined,
-		sessionManager: { appendSessionInit: () => {} },
+		// The executor records the child's session identity before prompting and
+		// installs a ready handler for structured subagent sessions.
+		sessionManager: {
+			appendSessionInit: () => {},
+			getSessionId: () => "sidecar-session",
+			getSessionFile: () => undefined,
+		},
+		installSubagentSessionReadyHandler: () => {},
 		getActiveToolNames: () => ["read", "yield"],
 		getEnabledToolNames: () => ["read", "yield"],
 		setActiveToolsByName: async (_toolNames: string[]) => {},
