@@ -2469,11 +2469,11 @@ describe("ACP agent", () => {
 		expect(cards).toHaveLength(1);
 		const card = cards[0]!.update;
 		if (card.sessionUpdate !== "tool_call") throw new Error("expected a tool_call update");
-		expect(card.title).toBe("Advisor · blocker");
+		// The advisor's name rides the title, so the note body carries neither it
+		// nor the severity the title already states.
+		expect(card.title).toBe("Advisor · reviewer · blocker");
 		expect(card.status).toBe("completed");
-		expect(card.content).toEqual([
-			{ type: "content", content: { type: "text", text: "> **blocker** _(reviewer)_ — Re-read the spec" } },
-		]);
+		expect(card.content).toEqual([{ type: "content", content: { type: "text", text: "Re-read the spec" } }]);
 		expect(card._meta?.advisor_notes).toEqual([
 			{ note: "Re-read the spec", severity: "blocker", advisor: "reviewer" },
 		]);

@@ -529,22 +529,42 @@ function extractAdvisorNotes(details: unknown): AdvisorNote[] {
 	return notes;
 }
 
-/** Severity of a single note, or the batch size — whichever the collapsed card can act on. */
+/** The advisor behind every note, when they agree — then the title can name it once. */
+function sharedAdvisorName(notes: readonly AdvisorNote[]): string | undefined {
+	const first = notes[0]?.advisor;
+	if (!first) return undefined;
+	return notes.every(note => note.advisor === first) ? first : undefined;
+}
+
+/**
+ * What the collapsed card can act on: who is speaking, and either the single
+ * note's severity or the batch size.
+ */
 function advisorCardTitle(notes: readonly AdvisorNote[]): string {
+	const shared = sharedAdvisorName(notes);
+	const who = shared ? `Advisor · ${shared}` : "Advisor";
 	const first = notes[0];
-	if (notes.length === 1 && first) return `Advisor · ${first.severity ?? "note"}`;
+	if (notes.length === 1 && first) return `${who} · ${first.severity ?? "note"}`;
 	const blockers = notes.filter(note => note.severity === "blocker").length;
-	const title = `Advisor · ${notes.length} notes`;
+	const title = `${who} · ${notes.length} notes`;
 	return blockers > 0 ? `${title} · ${blockers} blocker${blockers === 1 ? "" : "s"}` : title;
 }
 
-/** One note as a blockquote: the client analogue of the TUI card's severity rail. */
-function advisorNoteMarkdown(note: AdvisorNote): string {
-	const who = note.advisor ? ` _(${note.advisor})_` : "";
-	return `**${note.severity ?? "note"}**${who} — ${note.note}`
-		.split("\n")
-		.map(line => (line.length > 0 ? `> ${line}` : ">"))
-		.join("\n");
+/**
+ * One note's body.
+ *
+ * The card already carries the voice — an advisor card, the advisor's name and
+ * (for a single note) its severity in the title, the severity again as a rail
+ * in a client that renders advisories. So the body prefixes only what the card
+ * cannot say: the severity of each note in a batch, and the advisor behind a
+ * note when the batch mixes several. A blockquote is deliberately not used; it
+ * repeats the card's own rail and indent.
+ */
+function advisorNoteMarkdown(note: AdvisorNote, label: { severity: boolean; advisor: boolean }): string {
+	const prefix: string[] = [];
+	if (label.severity) prefix.push(`**${note.severity ?? "note"}**`);
+	if (label.advisor && note.advisor) prefix.push(`_(${note.advisor})_`);
+	return prefix.length > 0 ? `${prefix.join(" ")} — ${note.note}` : note.note;
 }
 
 /**
@@ -564,6 +584,7 @@ function advisorNoteMarkdown(note: AdvisorNote): string {
 export function buildAdvisorCardNotifications(sessionId: string, details: unknown): SessionNotification[] {
 	const notes = extractAdvisorNotes(details);
 	if (notes.length === 0) return [];
+	const label = { severity: notes.length > 1, advisor: sharedAdvisorName(notes) === undefined };
 	return [
 		toSessionNotification(sessionId, {
 			sessionUpdate: "tool_call",
@@ -571,7 +592,15 @@ export function buildAdvisorCardNotifications(sessionId: string, details: unknow
 			title: advisorCardTitle(notes),
 			kind: "think",
 			status: "completed",
-			content: [{ type: "content", content: { type: "text", text: notes.map(advisorNoteMarkdown).join("\n\n") } }],
+			content: [
+				{
+					type: "content",
+					content: {
+						type: "text",
+						text: notes.map(note => advisorNoteMarkdown(note, label)).join("\n\n"),
+					},
+				},
+			],
 			_meta: { advisor_notes: notes },
 		}),
 	];

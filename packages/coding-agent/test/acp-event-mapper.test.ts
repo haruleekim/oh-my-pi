@@ -204,9 +204,9 @@ describe("ACP event mapper", () => {
 		expect(update.title).toBe("Advisor · concern");
 		expect(update.kind).toBe("think");
 		expect(update.status).toBe("completed");
-		expect(update.content).toEqual([
-			{ type: "content", content: { type: "text", text: "> **concern** — Use `bun run test:rs`" } },
-		]);
+		// No blockquote and no severity prefix: the card's title and rail already
+		// carry the voice, so the body is just the note.
+		expect(update.content).toEqual([{ type: "content", content: { type: "text", text: "Use `bun run test:rs`" } }]);
 		expect(update._meta.advisor_notes).toEqual([{ note: "Use `bun run test:rs`", severity: "concern" }]);
 
 		// Clients upsert tool cards by id, so a shared id would make each note
@@ -246,9 +246,37 @@ describe("ACP event mapper", () => {
 		};
 		// The blank note is dropped, so the count reflects what the card shows.
 		expect(update.title).toBe("Advisor · 2 notes · 1 blocker");
+		// A batch cannot lean on the title for severity, so each note labels its
+		// own — and names the advisor that raised it.
 		expect(update.content[0]!.content.text).toBe(
-			"> **blocker** _(reviewer)_ — first\n>\n> second line\n\n> **note** — unnamed",
+			"**blocker** _(reviewer)_ — first\n\nsecond line\n\n**note** — unnamed",
 		);
+
+		// When every note came from the same advisor, the title names it once and
+		// the notes stop repeating it.
+		const shared = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "message_end",
+				message: {
+					role: "custom",
+					customType: "advisor",
+					content: "ignored",
+					details: {
+						notes: [
+							{ note: "first", severity: "concern", advisor: "reviewer" },
+							{ note: "second", severity: "nit", advisor: "reviewer" },
+						],
+					},
+				},
+			} as unknown as AgentSessionEvent,
+			"session-1",
+		);
+		const sharedUpdate = shared[0]!.update as {
+			title: string;
+			content: Array<{ content: { text: string } }>;
+		};
+		expect(sharedUpdate.title).toBe("Advisor · reviewer · 2 notes");
+		expect(sharedUpdate.content[0]!.content.text).toBe("**concern** — first\n\n**nit** — second");
 	});
 
 	it("emits nothing for an advisory with no usable notes or a non-advisor custom message", () => {
