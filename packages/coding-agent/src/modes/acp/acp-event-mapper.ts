@@ -27,6 +27,14 @@ interface AcpEventMapperOptions {
 	resolveImageData?: (data: string, mimeType: string | undefined) => string;
 	getFileSnapshot?: (path: string, versionId: string) => string | undefined;
 	/**
+	 * Content the agent published on a tool card out-of-band — today the plan
+	 * Markdown attached to the `session/request_permission` that reviews
+	 * `write xd://propose`. ACP `tool_call_update.content` *replaces* the
+	 * card's content list, so the finalizing update has to re-send that
+	 * content or the client drops it the instant the tool completes.
+	 */
+	getPinnedToolContent?: (toolCallId: string) => ToolCallContent[] | undefined;
+	/**
 	 * Session cwd. Tool call locations sent to ACP clients must be absolute
 	 * (the editor host needs them to open or focus files). When provided,
 	 * the mapper resolves raw `path`/`file`/etc. args against this cwd
@@ -246,7 +254,7 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 		case "tool_execution_update": {
 			if (isInternalHubMessageTool(event.toolName, event.args)) return [];
 			const content = mergeToolUpdateContent(
-				buildToolStartContent(event.toolCallId, event.toolName, event.args),
+				buildToolStartContent(event.toolCallId, event.toolName, event.args, options),
 				extractToolCallContent(event.partialResult, options),
 			);
 			const update: SessionUpdate = {
@@ -287,7 +295,7 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 				: [];
 			const resultContent = [...diffContent.blocks, ...fallbackContent, ...noticeContent];
 			const content = mergeToolUpdateContent(
-				buildToolStartContent(event.toolCallId, event.toolName, args),
+				buildToolStartContent(event.toolCallId, event.toolName, args, options),
 				resultContent,
 			);
 			const update: SessionUpdate = {
@@ -556,14 +564,25 @@ function getToolExecutionEndArgs(
 	return options.getToolArgs?.(event.toolCallId);
 }
 
-function buildToolStartContent(toolCallId: string, toolName: string, args: unknown): ToolCallContent[] {
-	if (isCommandToolName(toolName)) {
-		return buildCommandStartContent(toolCallId, args);
-	}
-	if (toolName === "eval") {
-		return buildEvalStartContent(toolCallId, args);
-	}
-	return [];
+/**
+ * Card content that must survive every later `tool_call_update` for this tool
+ * call. `options` is omitted on the `tool_call` start path: a pin is created
+ * while the tool runs (e.g. plan permission), so there is nothing to restore
+ * yet when the card is first announced.
+ */
+function buildToolStartContent(
+	toolCallId: string,
+	toolName: string,
+	args: unknown,
+	options?: AcpEventMapperOptions,
+): ToolCallContent[] {
+	const startContent = isCommandToolName(toolName)
+		? buildCommandStartContent(toolCallId, args)
+		: toolName === "eval"
+			? buildEvalStartContent(toolCallId, args)
+			: [];
+	const pinned = options?.getPinnedToolContent?.(toolCallId);
+	return pinned && pinned.length > 0 ? [...pinned, ...startContent] : startContent;
 }
 
 function buildCommandTitle(args: unknown): string | undefined {

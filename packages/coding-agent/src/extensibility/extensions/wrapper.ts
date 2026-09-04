@@ -253,14 +253,25 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			throw denyError(resolved, this.tool.name);
 		}
 		const pendingSafetyChecks = computerSafetyChecks(context);
-		// An xd:// device dispatch already cleared the write tool's outer gate at
-		// this tool's tier — re-prompting would double-ask for one action. The
-		// bypass only holds while the input is exactly what that outer gate
-		// approved: a handler revision here may have raised the tier, so revised
-		// input always faces the full gate. Explicit per-tool "prompt" policies
-		// and tool-demanded overrides still prompt. Provider safety checks are
-		// stronger: yolo, per-tool allow, and xdev approval never acknowledge
-		// them on the user's behalf.
+		// Two outer gates can already have approved this exact call; neither may
+		// be re-asked, and both only hold while the input is byte-identical to
+		// what they approved (a handler revision here may have raised the tier,
+		// so revised input always faces the full gate).
+		//
+		// `xdevApproved`: the *write* tool's gate cleared an xd:// dispatch at
+		// this tool's tier. That is a different tool from the device being
+		// dispatched, so an explicit per-tool "prompt" policy (or a
+		// tool-demanded override) on the device is still unanswered and prompts.
+		//
+		// `acpApproved`: the ACP client's permission gate asked about *this*
+		// tool with *this* input and the user allowed it — that gate is what an
+		// explicit "prompt" policy demands in an ACP session (see
+		// `SessionTools.#wrapToolForAcpPermission`, which skips only on explicit
+		// yolo opt-in and never for prompt/deny policies). Re-prompting would
+		// double-ask for one action, so the bypass covers `explicitPrompt` too.
+		//
+		// Provider safety checks are stronger than both: yolo, per-tool allow,
+		// xdev approval, and ACP approval never acknowledge them for the user.
 		const explicitPrompt = resolved.override || Object.hasOwn(userPolicies, resolved.policyKey ?? this.tool.name);
 		const xdevBypass = context?.xdevApproved === true && effectiveParams === params;
 		const acpBypass = context?.acpApproved === true && effectiveParams === params;

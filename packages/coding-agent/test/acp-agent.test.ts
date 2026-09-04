@@ -744,6 +744,57 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	});
 
+	it("keeps client-facing notifications on the wire session id after the provider session rotates", async () => {
+		// `AgentSession.sessionId` is the *provider* session id: `/fresh` and an
+		// in-place context reset mint a brand-new UUID for it while the client
+		// keeps addressing the session by the id `newSession` returned. Emitting
+		// notifications under the rotated id makes Zed drop every later update
+		// for a session that is still streaming.
+		const harness = await createHarness();
+		Settings.instance.set("plan.enabled", true);
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		const rotatedProviderSessionId = `provider-${Bun.randomUUIDv7()}`;
+		expect(rotatedProviderSessionId).not.toBe(created.sessionId);
+		session.sessionId = rotatedProviderSessionId;
+
+		const updatesBefore = harness.updates.length;
+		await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" });
+		await harness.agent.setSessionConfigOption({
+			sessionId: created.sessionId,
+			configId: "thinking",
+			value: "high",
+		});
+		await harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "ping" }],
+		});
+		// `/reload-plugins` is the only client-reachable path to
+		// `#emitAvailableCommandsUpdate`; the bootstrap advertisement lands
+		// before the rotation, so nothing else exercises it post-rotation.
+		await harness.agent.prompt({
+			sessionId: created.sessionId,
+			messageId: "00000000-0000-4000-8000-0000000000f1",
+			prompt: [{ type: "text", text: "/reload-plugins" }],
+		} as PromptRequest);
+
+		const emitted = harness.updates.slice(updatesBefore);
+		expect(emitted.length).toBeGreaterThan(0);
+		expect([...new Set(emitted.map(notification => notification.sessionId))]).toEqual([created.sessionId]);
+		// The rotated provider id must never reach the client, and the session
+		// must stay addressable under the id the client already holds.
+		expect(emitted.some(notification => notification.sessionId === rotatedProviderSessionId)).toBe(false);
+		expect(emitted.some(notification => notification.update.sessionUpdate === "current_mode_update")).toBe(true);
+		expect(emitted.some(notification => notification.update.sessionUpdate === "agent_message_chunk")).toBe(true);
+		expect(emitted.some(notification => notification.update.sessionUpdate === "available_commands_update")).toBe(
+			true,
+		);
+		expectAcpNotifications(harness.updates);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
 	it("cancels only a closed root's jobs and disposes the connection manager once", async () => {
 		const manager = new AsyncJobManager({});
 		const disposeSpy = spyOn(manager, "dispose");
@@ -996,6 +1047,90 @@ describe("ACP agent", () => {
 		]);
 
 		harness.abortController.abort();
+	});
+
+	it("keeps the reviewed plan Markdown on the propose card after the decision lands", async () => {
+		// The propose tool's own `tool_execution_end` reuses the permission
+		// card's `toolCallId`, and ACP content updates replace a card's content
+		// list — so the finalizing update has to re-send the plan or Zed's
+		// review card is left with nothing but the result line.
+		const harness = await createHarness({
+			permissionHandler: async () => ({ outcome: { outcome: "selected", optionId: "approve" } }),
+		});
+		Settings.instance.set("plan.enabled", true);
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" });
+
+		const localOptions = {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		};
+		cleanupRoots.push(resolveLocalUrlToPath("local://", localOptions));
+		const planContent = ["# Card plan", "", "- step one", "", "CARD-PLAN-MARKER"].join("\n");
+		await Bun.write(resolveLocalUrlToPath("local://PLAN.md", localOptions), planContent);
+
+		const toolCallId = "tc-card-plan";
+		const args = { path: "xd://propose", content: "card-plan" };
+		session.prompt = async (text: string): Promise<boolean> => {
+			session.promptCalls.push(text);
+			session.isStreaming = true;
+			for (const listener of session.listeners()) {
+				listener({ type: "tool_execution_start", toolCallId, toolName: "write", args } as AgentSessionEvent);
+			}
+			const result = await session.planProposalHandler!("card-plan", { toolCallId });
+			for (const listener of session.listeners()) {
+				listener({
+					type: "tool_execution_end",
+					toolCallId,
+					toolName: "write",
+					args,
+					result,
+					isError: false,
+				} as AgentSessionEvent);
+			}
+			const assistantMessage = makeAssistantMessage("plan submitted");
+			session.sessionManager.appendMessage(assistantMessage);
+			for (const listener of session.listeners()) {
+				listener({ type: "agent_end", messages: [assistantMessage] } as AgentSessionEvent);
+			}
+			session.isStreaming = false;
+			return true;
+		};
+
+		await harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "propose" }] });
+
+		const finalUpdate = harness.updates.findLast(
+			notification =>
+				notification.update.sessionUpdate === "tool_call_update" && notification.update.toolCallId === toolCallId,
+		);
+		if (finalUpdate?.update.sessionUpdate !== "tool_call_update") {
+			throw new Error("expected a finalizing tool_call_update for the propose card");
+		}
+		expect(finalUpdate.update.status).toBe("completed");
+		const content = finalUpdate.update.content ?? [];
+		expect(content[0]).toEqual({
+			type: "content",
+			content: {
+				type: "resource",
+				resource: {
+					uri: `omp-plan://tool/${toolCallId}/plan.md`,
+					text: planContent,
+					mimeType: "text/markdown",
+				},
+			},
+		});
+		// The approval result still reaches the card alongside the plan.
+		expect(
+			content.some(
+				item =>
+					item.type === "content" && item.content.type === "text" && item.content.text.includes("Plan approved"),
+			),
+		).toBe(true);
+		expectAcpNotifications(harness.updates);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
 	});
 
 	it("plan-proposal handler treats cancelled permission as refine, never approves", async () => {
