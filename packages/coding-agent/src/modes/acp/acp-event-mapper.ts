@@ -705,12 +705,20 @@ function extractEvalCells(args: unknown): EvalSourceCell[] {
 	return cells;
 }
 
+/**
+ * Name an eval call by the labels its cells carry.
+ *
+ * The language is deliberately absent: it already rides along on every source
+ * resource as a mime type, which lets a client name the runtime in the card's
+ * own chrome (a Python glyph beats a `[py]` prefix eating the title line).
+ * Untitled cells contribute nothing rather than a bare language tag, so the
+ * title falls through to the next candidate.
+ */
 function buildEvalTitle(args: unknown): string | undefined {
-	const cells = extractEvalCells(args);
-	if (cells.length === 0) {
-		return undefined;
-	}
-	return cells.map(cell => (cell.title ? `[${cell.language}] ${cell.title}` : `[${cell.language}]`)).join(" · ");
+	const labels = extractEvalCells(args)
+		.map(cell => cell.title?.trim())
+		.filter((label): label is string => label !== undefined && label.length > 0);
+	return labels.length > 0 ? labels.join(" · ") : undefined;
 }
 
 function buildEvalStartContent(toolCallId: string, args: unknown): ToolCallContent[] {
@@ -840,9 +848,9 @@ function buildToolSubject(toolName: string, args: unknown): string | undefined {
 }
 
 function buildToolTitle(toolName: string, args: unknown, intent: string | undefined): string {
-	// `eval` labels its own cells and the label carries the language
-	// (`[py] load config`) — context an intent phrase cannot express — so it
-	// stays ahead of `i`.
+	// `eval` cells carry hand-written labels ("imports", "load config") that
+	// name the step more precisely than a generic intent phrase, so they stay
+	// ahead of `i`.
 	let title = toolName === "eval" ? buildEvalTitle(args) : undefined;
 	// Otherwise the model's own `i` is the best one-line name a card can carry:
 	// intent tracing is on by default and the system prompt shapes it into a

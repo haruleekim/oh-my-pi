@@ -485,7 +485,7 @@ describe("ACP event mapper", () => {
 				}>;
 			};
 			expect(update.sessionUpdate).toBe("tool_call");
-			expect(update.title).toBe(`[${language}] source`);
+			expect(update.title).toBe("source");
 			expect(update.kind).toBe("execute");
 			expect(update.status).toBe("pending");
 			expect(update.rawInput).toEqual(args);
@@ -531,7 +531,9 @@ describe("ACP event mapper", () => {
 				};
 			}>;
 		};
-		expect(update.title).toBe("[?] · [py]");
+		// No cell carries a label, so the title falls through to the model's
+		// intent instead of naming the languages.
+		expect(update.title).toBe("evaluating");
 		expect(update.content).toEqual([
 			{
 				type: "content",
@@ -558,10 +560,26 @@ describe("ACP event mapper", () => {
 		]);
 	});
 
+	it("names eval cells by their labels without tagging the language", () => {
+		// The language reaches the client on each resource's mime type, so the
+		// title line is spent on what the cells do, not on repeating `[py]`.
+		const update = buildToolCallStartUpdate({
+			toolCallId: "tc-eval-labels",
+			toolName: "eval",
+			args: {
+				cells: [
+					{ language: "py", title: "imports", code: "import json" },
+					{ language: "py", title: " load config ", code: "json.loads(x)" },
+				],
+			},
+		}) as { title: string };
+		expect(update.title).toBe("imports · load config");
+	});
+
 	it("caps eval titles without truncating resource source", () => {
 		for (const [titleLength, titleEndsWithEllipsis] of [
-			[3_995, false],
-			[3_996, true],
+			[4_000, false],
+			[4_001, true],
 		] as const) {
 			const title = "t".repeat(titleLength);
 			const source = `${"x".repeat(4_500)}EVAL-SOURCE-END`;
