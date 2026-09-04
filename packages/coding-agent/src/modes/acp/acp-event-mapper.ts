@@ -13,7 +13,7 @@ import { editTargetPaths } from "../../edit/target-paths";
 import type { AdvisorNote, AdvisorSeverity } from "../../advisor";
 import { isAdvisorCard } from "../../session/queued-messages";
 import type { AgentSessionEvent } from "../../session/agent-session";
-import { shellSourceToolCallContent } from "../../session/acp-tool-content";
+import { consoleOutputToolCallContent, shellSourceToolCallContent } from "../../session/acp-tool-content";
 import { resolveToCwd, splitPathAndSel, splitPathAndSelPreferringLiteralSync } from "../../tools/path-utils";
 import type { TodoStatus } from "../../tools/todo";
 import { canonicalizeMessage } from "../../utils/thinking-display";
@@ -309,7 +309,12 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 			if (isInternalHubMessageTool(event.toolName, event.args)) return [];
 			const content = mergeToolUpdateContent(
 				buildToolStartContent(event.toolCallId, event.toolName, event.args, options),
-				extractToolCallContent(event.partialResult, options),
+				toConsoleOutputContent(
+					event.toolName,
+					event.args,
+					event.toolCallId,
+					extractToolCallContent(event.partialResult, options),
+				),
 			);
 			const update: SessionUpdate = {
 				sessionUpdate: "tool_call_update",
@@ -347,7 +352,11 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 			const noticeContent = usesStructuredMutationPresentation
 				? extractMutationNotices(event.result).map(textToolCallContent)
 				: [];
-			const resultContent = [...diffContent.blocks, ...fallbackContent, ...noticeContent];
+			const resultContent = toConsoleOutputContent(event.toolName, args, event.toolCallId, [
+				...diffContent.blocks,
+				...fallbackContent,
+				...noticeContent,
+			]);
 			const content = mergeToolUpdateContent(
 				buildToolStartContent(event.toolCallId, event.toolName, args, options),
 				resultContent,
@@ -765,6 +774,46 @@ function buildCommandTitle(args: unknown): string | undefined {
 function buildCommandStartContent(toolCallId: string, args: unknown): ToolCallContent[] {
 	const command = extractStringProperty<CommandContainer>(args, "command");
 	return command ? [shellSourceToolCallContent(toolCallId, command)] : [];
+}
+
+/**
+ * Whether this call's text result is console output rather than prose: bytes
+ * printed by a shell, a language runtime, or a managed process.
+ *
+ * `hub` mixes voices, so it is decided per op. `logs` replays a process
+ * screen; `jobs`, `wait` and friends author their own Markdown — headings and
+ * fenced job output — which fencing would flatten into literal `##` and
+ * backticks.
+ */
+function isConsoleOutputCall(toolName: string, args: unknown): boolean {
+	if (isCommandToolName(toolName) || toolName === "eval") return true;
+	return toolName === "hub" && extractStringProperty<OpContainer>(args, "op") === "logs";
+}
+
+/**
+ * Re-present a console call's text blocks as preformatted resources.
+ *
+ * Runs after extraction so the text-vs-text de-duplication in
+ * {@link extractToolCallContent} still applies — the readable-text fallback is
+ * compared against structured text before any of it becomes a resource, so a
+ * result cannot ship the same bytes twice.
+ *
+ * Diffs, images and terminal references pass through untouched: only text is
+ * output that a client would otherwise read as Markdown.
+ */
+function toConsoleOutputContent(
+	toolName: string,
+	args: unknown,
+	toolCallId: string,
+	content: ToolCallContent[],
+): ToolCallContent[] {
+	if (!isConsoleOutputCall(toolName, args)) return content;
+	let index = 0;
+	return content.map(item =>
+		item.type === "content" && item.content.type === "text"
+			? consoleOutputToolCallContent(toolCallId, index++, item.content.text)
+			: item,
+	);
 }
 
 function extractEvalCells(args: unknown): EvalSourceCell[] {
@@ -1222,10 +1271,29 @@ function extractToolCallContent(value: unknown, options: AcpEventMapperOptions):
 	if (!fallbackText) {
 		return content;
 	}
-	if (hasEquivalentTextContent(content, fallbackText)) {
+	// The fallback exists for results whose readable text is not structured
+	// content — a bare string, `message`, `errorMessage`. When it was produced
+	// by joining the very blocks just mapped, appending it repeats the output:
+	// invisible with one block (the equality check catches it), a second copy of
+	// everything with two.
+	if (hasEquivalentTextContent(content, fallbackText) || readableTextJoinsContentBlocks(value)) {
 		return content;
 	}
 	return [...content, textToolCallContent(fallbackText)];
+}
+
+/** Whether {@link extractReadableText} would derive its text by joining this
+ *  result's content blocks, rather than from a `text`/`errorMessage`/`message`
+ *  field. Mirrors that function's precedence. */
+function readableTextJoinsContentBlocks(value: unknown): boolean {
+	if (typeof value !== "object" || value === null) return false;
+	const directText =
+		extractStringProperty<TextLikeContent>(value, "text") ??
+		extractStringProperty<ErrorMessageContainer>(value, "errorMessage") ??
+		extractStringProperty<MessageContainer>(value, "message");
+	if (directText) return false;
+	const blocks = getContentBlocks(value);
+	return Boolean(blocks?.some(block => extractStringProperty<TextLikeContent>(block, "text")));
 }
 
 function extractStructuredToolCallContent(value: unknown, options: AcpEventMapperOptions): ToolCallContent[] {

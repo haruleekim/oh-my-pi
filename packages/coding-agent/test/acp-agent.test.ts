@@ -2193,7 +2193,19 @@ describe("ACP agent", () => {
 		expect(completions).toHaveLength(1);
 		expect(completions[0]).toEqual(
 			expect.objectContaining({
-				content: expect.arrayContaining([{ type: "content", content: { type: "text", text: "tests passed" } }]),
+				content: expect.arrayContaining([
+					{
+						type: "content",
+						content: {
+							type: "resource",
+							resource: {
+								uri: "omp-output://tool/toolu_bash_replay/output-0.txt",
+								text: "tests passed",
+								mimeType: "text/plain",
+							},
+						},
+					},
+				]),
 			}),
 		);
 

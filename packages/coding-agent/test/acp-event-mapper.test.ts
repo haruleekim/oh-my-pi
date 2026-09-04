@@ -70,6 +70,20 @@ function shellResourceContent(toolCallId: string, command: string) {
 	};
 }
 
+function outputResourceContent(toolCallId: string, index: number, text: string) {
+	return {
+		type: "content" as const,
+		content: {
+			type: "resource" as const,
+			resource: {
+				uri: `omp-output://tool/${toolCallId}/output-${index}.txt`,
+				text,
+				mimeType: "text/plain",
+			},
+		},
+	};
+}
+
 const TEST_MODEL: Model = buildModel({
 	id: "claude-sonnet-4-20250514",
 	name: "Claude Sonnet",
@@ -1139,7 +1153,7 @@ describe("ACP event mapper", () => {
 			content?: Array<{ type: string; terminalId?: string; content?: { type: string; text?: string } }>;
 		};
 		expect(update.sessionUpdate).toBe("tool_call_update");
-		expect(update.content).toContainEqual({ type: "content", content: { type: "text", text: "running" } });
+		expect(update.content).toContainEqual(outputResourceContent("tc-terminal-update-text", 0, "running"));
 		expect(update.content).toContainEqual({ type: "terminal", terminalId: "term-1" });
 	});
 
@@ -1165,7 +1179,7 @@ describe("ACP event mapper", () => {
 			content?: Array<{ type: string; terminalId?: string; content?: { type: string; text?: string } }>;
 		};
 		expect(update.sessionUpdate).toBe("tool_call_update");
-		expect(update.content).toContainEqual({ type: "content", content: { type: "text", text: "done" } });
+		expect(update.content).toContainEqual(outputResourceContent("tc-terminal-end", 0, "done"));
 		expect(update.content).toContainEqual({ type: "terminal", terminalId: "term-1" });
 	});
 
@@ -1196,7 +1210,7 @@ describe("ACP event mapper", () => {
 		};
 		expect(update.sessionUpdate).toBe("tool_call_update");
 		expect(update.content).toContainEqual(shellResourceContent("tc-terminal-final-command", "npm run check"));
-		expect(update.content).toContainEqual({ type: "content", content: { type: "text", text: "done" } });
+		expect(update.content).toContainEqual(outputResourceContent("tc-terminal-final-command", 0, "done"));
 		expect(update.content).toContainEqual({ type: "terminal", terminalId: "term-1" });
 	});
 
@@ -1233,15 +1247,95 @@ describe("ACP event mapper", () => {
 		};
 
 		expect(errorUpdate.content).toContainEqual({ type: "terminal", terminalId: "term-1" });
-		expect(errorUpdate.content).toContainEqual({
-			type: "content",
-			content: { type: "text", text: "command failed" },
-		});
+		expect(errorUpdate.content).toContainEqual(outputResourceContent("tc-terminal-error", 0, "command failed"));
 		expect(messageUpdate.content).toContainEqual({ type: "terminal", terminalId: "term-1" });
-		expect(messageUpdate.content).toContainEqual({
-			type: "content",
-			content: { type: "text", text: "command completed" },
-		});
+		expect(messageUpdate.content).toContainEqual(
+			outputResourceContent("tc-terminal-message", 0, "command completed"),
+		);
+	});
+
+	it("sends console output as a preformatted resource so Markdown cannot eat it", () => {
+		// Every character here means something in Markdown and nothing in a build
+		// log: `*` emphasis, `#` heading, `|` table, and leading spaces a code
+		// block. A client must show the bytes as printed.
+		const output = "| ok | 3 |\n*not emphasis*  # not a heading\n    indented\n`literal`";
+		for (const [toolName, args] of [
+			["bash", { command: "make" }],
+			["eval", { language: "py", code: "print(1)" }],
+			["hub", { op: "logs", name: "web" }],
+		] as const) {
+			const toolCallId = `tc-console-${toolName}`;
+			const updates = mapAgentSessionEventToAcpSessionUpdates(
+				{
+					type: "tool_execution_end",
+					toolCallId,
+					toolName,
+					args,
+					isError: false,
+					result: { content: [{ type: "text", text: output }] },
+				} as AgentSessionEvent,
+				"session-1",
+			);
+			expectAcpNotifications(updates);
+			const update = updates[0]!.update as { content?: unknown };
+			expect(update.content).toContainEqual(outputResourceContent(toolCallId, 0, output));
+		}
+
+		// `hub` mixes voices. `jobs` writes its own Markdown — headings and a
+		// fenced excerpt of job output — so fencing it again would show `##` and
+		// stray backticks instead of a rendered report.
+		const authored = "## Completed (1)\n\n### bg_1 [bash] — completed\n```\ndone\n```";
+		const jobs = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-hub-jobs",
+				toolName: "hub",
+				args: { op: "jobs" },
+				isError: false,
+				result: { content: [{ type: "text", text: authored }] },
+			} as AgentSessionEvent,
+			"session-1",
+		);
+		const jobsUpdate = jobs[0]!.update as { content?: unknown };
+		expect(jobsUpdate.content).toEqual([{ type: "content", content: { type: "text", text: authored } }]);
+
+		// Several text blocks stay separate resources: one uri each, or a client
+		// that keys content by uri would collapse them into one.
+		const multi = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-console-multi",
+				toolName: "bash",
+				isError: false,
+				result: {
+					content: [
+						{ type: "text", text: "first" },
+						{ type: "text", text: "second" },
+					],
+				},
+			} as AgentSessionEvent,
+			"session-1",
+		);
+		const multiUpdate = multi[0]!.update as { content?: unknown };
+		expect(multiUpdate.content).toEqual([
+			outputResourceContent("tc-console-multi", 0, "first"),
+			outputResourceContent("tc-console-multi", 1, "second"),
+		]);
+
+		// A tool whose result is prose keeps its text block — there the Markdown
+		// is the point.
+		const prose = mapAgentSessionEventToAcpSessionUpdates(
+			{
+				type: "tool_execution_end",
+				toolCallId: "tc-prose",
+				toolName: "web_search",
+				isError: false,
+				result: { content: [{ type: "text", text: output }] },
+			} as AgentSessionEvent,
+			"session-1",
+		);
+		const proseUpdate = prose[0]!.update as { content?: unknown };
+		expect(proseUpdate.content).toEqual([{ type: "content", content: { type: "text", text: output } }]);
 	});
 
 	it("keeps plain command output visible without terminal details", () => {
@@ -1262,7 +1356,7 @@ describe("ACP event mapper", () => {
 			content?: Array<{ type: string; content?: { type: string; text?: string } }>;
 		};
 
-		expect(update.content).toEqual([{ type: "content", content: { type: "text", text: "hello from stdout" } }]);
+		expect(update.content).toEqual([outputResourceContent("tc-plain-output", 0, "hello from stdout")]);
 	});
 
 	it("keeps long readable tool output intact across result shapes", () => {
@@ -1476,7 +1570,9 @@ describe("ACP event mapper", () => {
 			expect(toolCall?.rawInput).not.toEqual({ input: { command: "echo hi" } });
 			expect(toolCall?.content).toEqual([shellResourceContent("toolu_replay_input", "echo hi")]);
 			expect(finalUpdate?.content).toContainEqual(shellResourceContent("toolu_replay_input", "echo hi"));
-			expect(finalUpdate?.content).toContainEqual({ type: "content", content: { type: "text", text: "done" } });
+			// Replay routes through the same mapper, so a reopened session shows
+			// the same preformatted output the live turn did.
+			expect(finalUpdate?.content).toContainEqual(outputResourceContent("toolu_replay_input", 0, "done"));
 			expect(finalUpdate?.content).toContainEqual({ type: "terminal", terminalId: "term-replay" });
 		} finally {
 			abortController.abort();

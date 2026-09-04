@@ -29,6 +29,7 @@
 - `edit` and `ast_edit` now report their target files to ACP clients as tool-call locations while the call streams, so the editor can open them before the result lands.
 - `eval` tool cards in ACP clients are now titled by the cell's own label instead of a `[py]`-style language prefix; the language still travels on the source resource, so clients can name the runtime in the card itself.
 - Advisor interventions now reach ACP clients as their own card instead of being invisible: the notes render as Markdown, severity is in the card title, and clients that want their own chrome get the notes structurally in `_meta.advisor_notes`.
+- Console output sent to ACP clients (`bash`, `eval`, `hub logs`) now travels as a preformatted resource, so a client renders it as printed instead of as Markdown — a `*` in a build log is no longer emphasis, `#` no longer a heading, and columns stay aligned. Hub ops that author their own Markdown, such as `jobs`, are unaffected.
 
 ### Fixed
 
@@ -193,6 +194,7 @@
 - ACP plan review cards now keep the full plan Markdown after approve or refine, instead of replacing it with the result line.
 - Reopening a session in an ACP client no longer replays advisor notes as user messages, which made the agent-facing `<advisory>` blocks look like something the user had typed.
 - File writes now render as diffs in ACP clients instead of showing only the write summary.
+- Tool results carrying more than one text block no longer send their output twice to ACP clients.
 - Anthropic sessions now keep tool-roster changes and warm-prefix pruning from invalidating preserved thinking or the prompt cache.
 - TypeScript code intelligence now works on TypeScript 7 projects: the built-in `typescript-native` server runs `tsc --lsp --stdio` when the resolved TypeScript install no longer ships `tsserver.js`, replacing `typescript-language-server` for that project.
 - Claude marketplace MCP servers now resolve environment placeholders in stdio environment values instead of passing strings such as `${NAME:-}` literally ([#10481](https://github.com/can1357/oh-my-pi/pull/10481) by [@mrexodia](https://github.com/mrexodia)).
